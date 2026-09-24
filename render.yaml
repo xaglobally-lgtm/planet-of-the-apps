@@ -1,6 +1,8 @@
 # Render Blueprint: creates the backend API for all 14 XAG apps in one go.
 # Render -> New -> Blueprint -> pick the planet-of-the-apps repo.
-# You'll be asked ONCE for SUPABASE_SERVICE_ROLE_KEY (shared group below).
+# After the first sync, add SUPABASE_SERVICE_ROLE_KEY ONCE to the "xag-shared"
+# environment group (Render -> Environment Groups). All 14 services redeploy with it.
+# (Render does not allow secret prompts inside environment groups.)
 # API_ADMIN_KEY / API_ADMIN_PIN are generated randomly by Render per service.
 
 envVarGroups:
@@ -8,8 +10,6 @@ envVarGroups:
     envVars:
       - key: SUPABASE_URL
         value: https://iwpfhalextbzbvcajtxu.supabase.co
-      - key: SUPABASE_SERVICE_ROLE_KEY
-        sync: false
       - key: NODE_ENV
         value: production
       - key: LOG_LEVEL
