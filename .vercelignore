@@ -1,0 +1,10 @@
+# Deploy ONLY Planet of the Apps' own files; everything else in this repo is ignored by Vercel.
+/*
+!index.html
+!app.js
+!styles.css
+!sw.js
+!manifest.webmanifest
+!icon.svg
+!icon-maskable.svg
+!vercel.json
