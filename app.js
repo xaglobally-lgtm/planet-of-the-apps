@@ -9,6 +9,20 @@ const SUPABASE_URL = 'https://iwpfhalextbzbvcajtxu.supabase.co';
 // Public (anon) key: safe in a browser; row-level security limits every row to its owner.
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml3cGZoYWxleHRiemJ2Y2FqdHh1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk4NzY1MjcsImV4cCI6MjEwNTQ1MjUyN30.Gi717bXdX-WFCAc6wd7uAY-DiOokH5htMbX4bD7psZo';
 const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } });
+// Server-side "brain" (Supabase Edge Function): holds service tokens + the Anthropic key; the browser never sees them.
+async function brain(action, body = {}) {
+  const { data } = await sb.auth.getSession();
+  const token = data.session?.access_token;
+  if (!token) throw new Error('Please sign in again');
+  const r = await fetch(`${SUPABASE_URL}/functions/v1/planet-brain`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, apikey: SUPABASE_ANON_KEY },
+    body: JSON.stringify({ action, ...body }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || j.message || `Brain error ${r.status}`);
+  return j;
+}
 
 // ---------- defaults ----------
 const DEFAULT_PREFS = {
@@ -21,6 +35,16 @@ const DEFAULT_PREFS = {
     { key: 'price', label: 'Price / plan', type: 'text' },
     { key: 'launch_date', label: 'Launch date', type: 'date' },
   ],
+  automation: { refreshOnOpen: true, checkEveryHours: 6, briefingOnOpen: true },
+  prices: { vercelPro: 20, supabasePro: 25, renderStarter: 7 },
+  currency: 'usd',
+};
+const AI_LEVELS = ['Observe: AI can look, nothing more', 'Recommend: AI suggests what to do', 'Prepare: AI may draft fixes for your approval'];
+const BILLING = {
+  supabase: 'https://supabase.com/dashboard/org/ufrlkjdxphadjnqcnmfj/billing',
+  vercel: 'https://vercel.com/account/billing',
+  render: 'https://dashboard.render.com/billing',
+  anthropic: 'https://console.anthropic.com/settings/limits',
 };
 const PALETTE = ['#7c5cff', '#f2b84b', '#62d6c6', '#ff8193', '#6aa8ff', '#b784f7', '#8fd46b', '#ff9f5a'];
 const ITEM_KINDS = { note: 'Note', link: 'Link', code: 'Code snippet', doc: 'Document', contact: 'Contact', task: 'Task' };
@@ -55,6 +79,8 @@ const S = {
   session: null, apps: [], perms: [], items: [], secrets: [], settings: null, prefs: { ...DEFAULT_PREFS },
   page: localStorage.getItem('planet.page') || 'orbit', q: '', cat: '', status: '', sort: 'name',
   openId: null, tab: 'overview', focusCat: '', vaultKey: null, revealed: {}, installPrompt: null,
+  checks: [], events: [], briefing: null, chat: [], links: [], revenue: [], customers: [], expenses: [],
+  brainStatus: null, busy: {}, keysByApp: {}, newKey: null, evFilter: '',
 };
 
 // ---------- helpers ----------
@@ -64,6 +90,22 @@ const safeUrl = (u) => { try { const x = new URL(u); return /^https?:$/.test(x.p
 const csv = (s) => String(s || '').split(',').map((x) => x.trim()).filter(Boolean);
 const byId = (id) => S.apps.find((a) => a.id === id);
 const isLive = (a) => (S.prefs.liveStatuses || []).includes(a.status);
+// Latest check per app+target -> overall health: up | asleep | down | unknown
+function latestCheck(appId, target) { return S.checks.find((c) => c.app_id === appId && c.target === target); }
+function health(a) {
+  const w = latestCheck(a.id, 'website'), p = latestCheck(a.id, 'api');
+  if (!w && !p) return 'unknown';
+  if ((w && w.state === 'down') || (p && p.state === 'down')) return 'down';
+  if (p && p.state === 'asleep') return 'asleep';
+  return 'up';
+}
+const HEALTH_LABEL = { up: 'Healthy', asleep: 'Asleep (normal on free plan)', down: 'Needs attention', unknown: 'Not checked yet' };
+const ago = (t) => { if (!t) return 'never'; const m = Math.round((Date.now() - new Date(t).getTime()) / 60000); return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`; };
+const money = (cents, cur = 'usd') => { try { return new Intl.NumberFormat(undefined, { style: 'currency', currency: String(cur).toUpperCase() }).format((cents || 0) / 100); } catch { return `${((cents || 0) / 100).toFixed(2)} ${String(cur).toUpperCase()}`; } };
+function monthlyCents(x) { return x.cadence === 'yearly' ? Math.round(x.amount_cents / 12) : x.cadence === 'monthly' ? x.amount_cents : 0; }
+function activeExpense(x) { const today = new Date().toISOString().slice(0, 10); return x.starts_on <= today && (!x.ends_on || x.ends_on >= today); }
+function sumBy(rows, f) { const out = {}; for (const r of rows) { const [cur, v] = f(r); out[cur] = (out[cur] || 0) + v; } return out; }
+const moneyMulti = (o) => { const e = Object.entries(o).filter(([, v]) => v); return e.length ? e.map(([c, v]) => money(v, c)).join(' + ') : money(0, S.prefs.currency); };
 function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove('show'), 2600); }
 function fail(e) { console.error(e); toast(e?.message || String(e)); }
 function applyTheme() { document.documentElement.dataset.theme = S.prefs.theme || 'auto'; }
@@ -97,7 +139,27 @@ async function loadAll() {
     S.settings = ins.data;
   } else S.settings = settings.data;
   S.prefs = { ...DEFAULT_PREFS, ...(S.settings.prefs || {}) };
+  S.prefs.automation = { ...DEFAULT_PREFS.automation, ...(S.prefs.automation || {}) };
+  S.prefs.prices = { ...DEFAULT_PREFS.prices, ...(S.prefs.prices || {}) };
   applyTheme();
+  await loadOps();
+}
+// Monitoring, AI and money data (read-only for the browser; written by the brain)
+async function loadOps() {
+  const since = new Date(Date.now() - 400 * 864e5).toISOString();
+  const res = await Promise.all([
+    sb.from('planet_checks').select('*').order('checked_at', { ascending: false }).limit(300),
+    sb.from('planet_events').select('*').order('created_at', { ascending: false }).limit(150),
+    sb.from('planet_briefings').select('*').order('created_at', { ascending: false }).limit(1).maybeSingle(),
+    sb.from('planet_chat').select('*').order('created_at', { ascending: true }).limit(60),
+    sb.from('planet_payment_links').select('*'),
+    sb.from('planet_revenue').select('*').gte('occurred_at', since).order('occurred_at', { ascending: false }).limit(5000),
+    sb.from('planet_customers').select('*'),
+    sb.from('planet_expenses').select('*').order('created_at'),
+  ]);
+  const [checks, events, briefing, chat, links, revenue, customers, expenses] = res.map((r) => { if (r.error) { console.warn(r.error); return { data: null }; } return r; });
+  S.checks = checks.data || []; S.events = events.data || []; S.briefing = briefing.data || null; S.chat = chat.data || [];
+  S.links = links.data || []; S.revenue = revenue.data || []; S.customers = customers.data || []; S.expenses = expenses.data || [];
 }
 async function savePrefs(patch) {
   S.prefs = { ...S.prefs, ...patch };
@@ -118,15 +180,20 @@ async function mutate(table, op, payload, id) {
 
 // ---------- rendering ----------
 const NAV = [
-  ['orbit', '🪐', 'Planet'], ['apps', '▦', 'Apps'], ['permissions', '🔑', 'Access'], ['vault', '🔒', 'Codes'], ['settings', '⚙️', 'Settings'],
+  ['orbit', '🪐', 'Planet'], ['apps', '▦', 'Apps'], ['ask', '💬', 'Ask'], ['money', '💰', 'Money'], ['activity', '📡', 'Activity'],
+  ['permissions', '🔑', 'Access'], ['vault', '🔒', 'Codes'], ['plans', '🧾', 'Plans'], ['settings', '⚙️', 'Settings'],
 ];
+const MOBILE_NAV = ['orbit', 'apps', 'ask', 'money', 'more'];
 const MARK = `<svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true"><circle cx="32" cy="32" r="15" fill="#f2b84b"/><ellipse cx="32" cy="32" rx="29" ry="9" fill="none" stroke="#62d6c6" stroke-width="3" transform="rotate(-20 32 32)"/><circle cx="55" cy="22" r="4" fill="#ff8193"/></svg>`;
 
 function render() {
   const root = $('#app');
   if (!S.session) { root.innerHTML = authView(); return; }
-  const nav = (cls) => NAV.map(([k, ico, label]) => `<button class="nav-btn ${cls}" data-act="nav" data-page="${k}" ${S.page === k ? 'aria-current="page"' : ''}><span class="ico" aria-hidden="true">${ico}</span><span>${label}</span></button>`).join('');
-  const pages = { orbit: orbitView, apps: appsView, permissions: permsView, vault: vaultView, settings: settingsView };
+  const btn = ([k, ico, label]) => `<button class="nav-btn" data-act="nav" data-page="${k}" ${S.page === k || (k === 'more' && MORE.includes(S.page)) ? 'aria-current="page"' : ''}><span class="ico" aria-hidden="true">${ico}</span><span>${label}</span></button>`;
+  const nav = () => NAV.map(btn).join('');
+  const mobileNav = () => MOBILE_NAV.map((k) => k === 'more' ? btn(['more', '☰', 'More']) : btn(NAV.find((n) => n[0] === k))).join('');
+  const pages = { orbit: orbitView, apps: appsView, permissions: permsView, vault: vaultView, settings: settingsView,
+    ask: askView, money: moneyView, activity: activityView, plans: plansView, more: moreView };
   root.innerHTML = `
     <div class="shell">
       <nav class="rail" aria-label="Main">
@@ -137,7 +204,7 @@ function render() {
         <p class="small muted" style="padding:0.5rem 0.4rem">${esc(S.session.user.email)}</p>
       </nav>
       <main class="main" id="main">${(pages[S.page] || orbitView)()}</main>
-      <nav class="bottom-nav" aria-label="Main">${nav('')}</nav>
+      <nav class="bottom-nav" aria-label="Main">${mobileNav()}</nav>
     </div>
     ${S.openId ? drawerView() : ''}`;
 }
@@ -166,8 +233,9 @@ function filtered() {
 
 function orbitView() {
   const cats = [...new Set(S.apps.map((a) => a.category || 'Uncategorised'))];
-  const live = S.apps.filter(isLive).length;
   if (!S.apps.length) return emptyState();
+  const hc = { up: 0, asleep: 0, down: 0, unknown: 0 }; S.apps.forEach((a) => hc[health(a)]++);
+  const lastCheck = S.checks[0]?.checked_at;
   const n = cats.length;
   const rings = cats.map((c, i) => { const r = 24 + (i + 1) * (72 / (n + 0.5)); return { c, r }; });
   let bodies = '', idx = 0;
@@ -177,17 +245,19 @@ function orbitView() {
       const ang = (j / apps.length) * Math.PI * 2 + ri * 0.7 - Math.PI / 2;
       const x = 50 + (r / 2) * Math.cos(ang), y = 50 + (r / 2) * Math.sin(ang);
       const dim = S.focusCat && S.focusCat !== c;
-      bodies += `<button class="body" style="left:${x}%;top:${y}%;--c:${esc(a.color)};--i:${idx++};${dim ? 'opacity:.25' : ''}" data-act="open" data-id="${a.id}" data-live="${isLive(a) ? 1 : 0}" aria-label="${esc(a.name)}, ${esc(a.status)}"><span class="disc" aria-hidden="true">${esc(a.icon || '🪐')}</span><span class="lbl">${esc(a.name)}</span></button>`;
+      bodies += `<button class="body" style="left:${x}%;top:${y}%;--c:${esc(a.color)};--i:${idx++};${dim ? 'opacity:.25' : ''}" data-act="open" data-id="${a.id}" data-health="${health(a)}" aria-label="${esc(a.name)}: ${esc(HEALTH_LABEL[health(a)])}"><span class="disc" aria-hidden="true">${esc(a.icon || '🪐')}</span><span class="lbl">${esc(a.name)}</span></button>`;
     });
   });
   const ringHtml = rings.map(({ r }) => `<div class="ring" style="width:${r}%;height:${r}%"></div>`).join('');
   return `
     <div class="page-head"><div><h1>Your planet</h1>
-      <div class="stat-line"><span><b>${S.apps.length}</b><span class="muted small">apps</span></span><span><b>${live}</b><span class="muted small">live</span></span><span><b>${cats.length}</b><span class="muted small">categories</span></span><span><b>${S.secrets.length}</b><span class="muted small">codes stored</span></span></div></div>
-      <div class="row"><button class="btn" data-act="toggle-labels">${S.prefs.labels ? 'Hide names' : 'Show names'}</button><button class="btn primary" data-act="new-app">Add app</button></div></div>
+      <div class="stat-line"><span><b>${S.apps.length}</b><span class="muted small">apps</span></span><span><b class="h-up">${hc.up}</b><span class="muted small">healthy</span></span><span><b class="h-asleep">${hc.asleep}</b><span class="muted small">asleep</span></span><span><b class="h-down">${hc.down}</b><span class="muted small">need attention</span></span>${hc.unknown ? `<span><b>${hc.unknown}</b><span class="muted small">not checked</span></span>` : ''}</div>
+      <p class="small muted" style="margin-top:.3rem">Last health check: ${ago(lastCheck)}</p></div>
+      <div class="row"><button class="btn" data-act="refresh" ${S.busy.refresh ? 'disabled' : ''}>${S.busy.refresh ? 'Checking…' : 'Check now'}</button><button class="btn" data-act="toggle-labels">${S.prefs.labels ? 'Hide names' : 'Show names'}</button><button class="btn primary" data-act="new-app">Add app</button></div></div>
+    ${briefingCard()}
     <div class="orbit-wrap">
       <div class="orbit ${S.prefs.labels ? 'labels' : ''} ${S._revealed ? '' : 'reveal'}" role="group" aria-label="Apps arranged by category">${ringHtml}<div class="sun" aria-hidden="true">Planet<br/>of the<br/>Apps</div>${bodies}</div>
-      <div class="legend"><h3>Categories</h3><p class="small muted">Inner ring first. Tap a category to highlight it; tap an app to open it. A teal ring means it's live.</p>
+      <div class="legend"><h3>Categories</h3><p class="small muted">Inner ring first. Tap a category to highlight it; tap an app to open it. Ring colour: <span class="h-up">teal</span> healthy, <span class="h-asleep">gold dashed</span> asleep, <span class="h-down">red</span> needs attention.</p>
         ${cats.map((c) => `<button data-act="focus-cat" data-cat="${esc(c)}" aria-pressed="${S.focusCat === c}"><span>${esc(c)}</span><span class="pill">${S.apps.filter((a) => (a.category || 'Uncategorised') === c).length}</span></button>`).join('')}
       </div>
     </div>`;
@@ -269,6 +339,36 @@ function settingsView() {
       <div><button class="btn primary">Save settings</button></div>
     </form>
     <div class="panel stack">
+      <h2>Connections</h2>
+      <p class="muted">The brain holds these keys on the server, so they never reach this browser. Add each one in Supabase → Edge Functions → <strong>Secrets</strong> (project "API Verifier LIVE").</p>
+      ${(() => { const c = S.brainStatus?.configured || {}; const row = (k, name, what) => `<li class="conn"><span class="pill ${c[k] ? 'live' : ''}">${c[k] ? 'Connected' : 'Not set'}</span><span><strong class="code">${name}</strong><br/><span class="small muted">${what}</span></span></li>`;
+        return S.brainStatus?.error ? `<p class="h-down small">Couldn't reach the brain: ${esc(S.brainStatus.error)}</p>` : `<ul class="conn-list">
+        ${row('anthropic', 'ANTHROPIC_API_KEY', 'Briefing, Ask Planet, Explain this app')}
+        ${row('vercel', 'VERCEL_TOKEN', 'Website deploy status (read-only use)')}
+        ${row('render', 'RENDER_API_KEY', 'API deploy status and plan info')}
+        ${row('github', 'GITHUB_TOKEN', 'Optional: only needed for private repos')}</ul>`; })()}
+      <div class="row"><button class="btn" data-act="brain-status">Check connections</button><span class="small muted">AI model: ${esc(S.brainStatus?.model || '…')}</span></div>
+    </div>
+    <form class="panel stack" data-form="automation">
+      <h2>Automation</h2>
+      <label class="row"><input type="checkbox" name="refreshOnOpen" ${S.prefs.automation.refreshOnOpen ? 'checked' : ''} style="width:auto" /> Check health, deploys, errors and payments when I open Planet</label>
+      <label class="field"><span>Check each app at most every … hours (wakes sleeping free services, so keep this gentle)</span><input name="checkEveryHours" type="number" min="1" max="72" value="${esc(S.prefs.automation.checkEveryHours)}" style="max-width:8rem" /></label>
+      <label class="row"><input type="checkbox" name="briefingOnOpen" ${S.prefs.automation.briefingOnOpen ? 'checked' : ''} style="width:auto" /> Write my daily briefing (at most once every 20 hours)</label>
+      <p class="small muted">AI fixes and automatic deploys are switched off. They arrive in a later phase as proposals you approve, never automatic changes.</p>
+      <div><button class="btn primary">Save automation</button></div>
+    </form>
+    <form class="panel stack" data-form="prices">
+      <h2>Plan prices</h2>
+      <p class="muted small">Used on the Plans page. Update them if a provider changes its prices.</p>
+      <div class="grid-2">
+        <label class="field"><span>Vercel Pro ($/month)</span><input name="vercelPro" type="number" step="0.01" value="${esc(S.prefs.prices.vercelPro)}" /></label>
+        <label class="field"><span>Supabase Pro ($/month)</span><input name="supabasePro" type="number" step="0.01" value="${esc(S.prefs.prices.supabasePro)}" /></label>
+        <label class="field"><span>Render Starter, per app ($/month)</span><input name="renderStarter" type="number" step="0.01" value="${esc(S.prefs.prices.renderStarter)}" /></label>
+        <label class="field"><span>Main currency for Money</span><input name="currency" value="${esc(S.prefs.currency.toUpperCase())}" maxlength="3" /></label>
+      </div>
+      <div><button class="btn primary">Save prices</button></div>
+    </form>
+    <div class="panel stack">
       <h2>Custom fields</h2>
       <p class="muted">Add your own fields to every app, such as price, owner, client or renewal date.</p>
       ${p.fields.length ? `<div class="table-wrap"><table><thead><tr><th>Field</th><th>Type</th><th></th></tr></thead><tbody>${p.fields.map((f, i) => `<tr><td>${esc(f.label)}</td><td>${esc(f.type)}${f.options ? ': ' + esc(f.options.join(', ')) : ''}</td><td><button class="btn sm danger" data-act="del-field" data-i="${i}">Remove</button></td></tr>`).join('')}</tbody></table></div>` : ''}
@@ -292,11 +392,11 @@ function settingsView() {
 function drawerView() {
   const a = byId(S.openId);
   if (!a) { S.openId = null; return ''; }
-  const tabs = [['overview', 'Overview'], ['access', 'Access'], ['codes', 'Codes'], ['notes', 'Notes & code'], ['fields', 'Fields']];
-  const body = { overview: tabOverview, access: tabAccess, codes: tabCodes, notes: tabNotes, fields: tabFields }[S.tab](a);
+  const tabs = [['overview', 'Overview'], ['health', 'Health'], ['money', 'Money'], ['keys', 'API keys'], ['access', 'Access'], ['codes', 'Codes'], ['notes', 'Notes & code'], ['fields', 'Fields']];
+  const body = { overview: tabOverview, health: tabHealth, money: tabMoney, keys: tabKeys, access: tabAccess, codes: tabCodes, notes: tabNotes, fields: tabFields }[S.tab](a);
   return `<div class="scrim" data-act="close-drawer"><aside class="drawer" role="dialog" aria-modal="true" aria-label="${esc(a.name)}" data-stop>
     <div class="drawer-head" style="--c:${esc(a.color)}"><span class="disc" aria-hidden="true">${esc(a.icon || '🪐')}</span>
-      <div class="grow"><h2>${esc(a.name)}</h2><p class="muted small">${esc(a.category || 'Uncategorised')} <span class="pill ${isLive(a) ? 'live' : ''}">${esc(a.status)}</span></p></div>
+      <div class="grow"><h2>${esc(a.name)}</h2><p class="muted small">${esc(a.category || 'Uncategorised')} <span class="pill ${isLive(a) ? 'live' : ''}">${esc(a.status)}</span> <span class="pill h-${health(a)}">${esc(HEALTH_LABEL[health(a)])}</span></p></div>
       <button class="btn sm" data-act="close-drawer-btn" aria-label="Close">✕</button></div>
     <div class="tabs" role="tablist">${tabs.map(([k, l]) => `<button class="tab" role="tab" aria-selected="${S.tab === k}" data-act="tab" data-tab="${k}">${l}</button>`).join('')}</div>
     ${body}
@@ -318,6 +418,8 @@ function tabOverview(a) {
       <dt>Tags</dt><dd><div class="tags">${(a.tags || []).map((t) => `<span class="pill">${esc(t)}</span>`).join('') || '<span class="muted">None</span>'}</div></dd>
     </dl>
     <div class="row">${a.frontend_url ? `<button class="btn sm" data-act="ping" data-url="${esc(a.frontend_url)}">Check website</button>` : ''}${a.backend_url ? `<button class="btn sm" data-act="ping" data-url="${esc(a.backend_url.replace(/\/$/, '') + '/health')}">Check API</button>` : ''}</div>
+    <div class="row"><button class="btn" data-act="explain" data-id="${a.id}" ${S.busy.explain ? 'disabled' : ''}>${S.busy.explain ? 'Reading the code…' : '✨ Explain this app'}</button><span class="small muted">AI level: ${esc((AI_LEVELS[a.ai_level ?? 1] || '').split(':')[0])}</span></div>
+    ${(() => { const d = S.items.find((i) => i.app_id === a.id && i.title === 'Plain-English explanation (AI)'); return d ? `<details class="item"><summary><strong>Plain-English explanation</strong> <span class="small muted">${ago(d.created_at)}</span></summary><p style="white-space:pre-wrap;margin-top:.5rem">${esc(d.body)}</p></details>` : ''; })()}
     <div class="row"><button class="btn primary" data-act="edit-app" data-id="${a.id}">Edit app</button><button class="btn" data-act="pin" data-id="${a.id}">${a.pinned ? 'Unpin' : 'Pin to top'}</button><button class="btn danger" data-act="del-app" data-id="${a.id}">Delete app</button></div>
   </div>`;
 }
@@ -348,6 +450,202 @@ function fieldInput(f, v) {
   return `<label class="field"><span>${esc(f.label)}</span><input name="${n}" type="${f.type === 'url' ? 'url' : f.type === 'number' ? 'number' : f.type === 'date' ? 'date' : 'text'}" value="${esc(v)}" step="any" /></label>`;
 }
 
+// ---------- Phase A: operations, AI and money screens ----------
+const MORE = ['activity', 'permissions', 'vault', 'plans', 'settings'];
+const dayPart = () => { const h = new Date().getHours(); return h < 12 ? 'morning' : h < 18 ? 'afternoon' : 'evening'; };
+const aiOff = () => !!(S.brainStatus?.configured && !S.brainStatus.configured.anthropic);
+
+function moreView() {
+  return `<div class="page-head"><h1>More</h1></div><div class="app-list">${NAV.filter((n) => MORE.includes(n[0])).map(([k, ico, label]) =>
+    `<button class="app-row" data-act="nav" data-page="${k}"><span class="disc" style="--c:var(--surface-2)" aria-hidden="true">${ico}</span><span class="meta"><strong>${label}</strong></span><span aria-hidden="true">›</span></button>`).join('')}</div>`;
+}
+
+function briefingCard() {
+  if (aiOff()) return `<div class="panel brief"><h2>☀️ Good ${dayPart()}</h2><p class="muted">Your daily briefing appears here once the Anthropic key is connected (Settings → Connections).</p></div>`;
+  if (!S.briefing) return S.brainStatus?.configured?.anthropic ? `<div class="panel brief"><h2>☀️ Good ${dayPart()}</h2><p class="muted">${S.busy.brief ? 'Writing your first briefing…' : 'No briefing yet today.'}</p><div><button class="btn sm" data-act="brief-refresh" ${S.busy.brief ? 'disabled' : ''}>Write it now</button></div></div>` : '';
+  return `<div class="panel brief"><div class="row" style="justify-content:space-between"><h2>☀️ Good ${dayPart()}</h2><button class="btn sm" data-act="brief-refresh" ${S.busy.brief ? 'disabled' : ''}>${S.busy.brief ? 'Writing…' : 'Refresh'}</button></div>
+    <p class="brief-text">${esc(S.briefing.content)}</p><p class="small muted">Written ${ago(S.briefing.created_at)} by Claude from your live data.</p></div>`;
+}
+
+const SUGGEST = ['What needs my attention today?', 'Which apps are healthy and which are asleep?', 'Which apps are closest to taking payments?', 'Summarise errors from the last week.', 'What am I spending each month?'];
+function askView() {
+  const off = aiOff(), busy = S.busy.ask;
+  return `<div class="page-head"><div><h1>Ask Planet</h1><p class="muted">Questions about your whole portfolio, answered by Claude from your live data. Read-only: it can't change anything.</p></div>${S.chat.length ? '<button class="btn sm" data-act="chat-clear">Clear chat</button>' : ''}</div>
+  ${off ? '<div class="panel" style="margin-bottom:1rem"><p>Connect the Anthropic key first (Settings → Connections).</p></div>' : ''}
+  <div class="chat" id="chat">${S.chat.length ? S.chat.map((m) => `<div class="msg ${m.role === 'user' ? 'user' : 'assistant'}"><p>${esc(m.content)}</p></div>`).join('')
+    : `<div class="empty"><p class="muted">Try one of these:</p><div class="row" style="justify-content:center">${SUGGEST.map((q) => `<button class="btn sm" data-act="ask-suggest" data-q="${esc(q)}" ${off || busy ? 'disabled' : ''}>${esc(q)}</button>`).join('')}</div></div>`}
+  ${busy ? '<div class="msg assistant"><p class="muted">Thinking…</p></div>' : ''}</div>
+  <form class="ask-bar" data-form="ask"><input name="q" placeholder="Ask about your apps…" autocomplete="off" required ${off || busy ? 'disabled' : ''} aria-label="Your question" /><button class="btn primary" ${off || busy ? 'disabled' : ''}>Ask</button></form>`;
+}
+async function doAsk(q) {
+  q = String(q || '').trim(); if (!q || S.busy.ask) return;
+  S.chat.push({ role: 'user', content: q, created_at: new Date().toISOString() }); S.busy.ask = true; render(); scrollChat();
+  try { const r = await brain('ask', { question: q }); S.chat.push({ role: 'assistant', content: r.answer, created_at: new Date().toISOString() }); }
+  catch (e) { S.chat.push({ role: 'assistant', content: `Sorry, that didn't work: ${e.message}` }); }
+  S.busy.ask = false; render(); scrollChat(); $('.ask-bar input')?.focus();
+}
+function scrollChat() { requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight })); }
+
+function activityView() {
+  const f = S.evFilter;
+  const list = S.events.filter((e) => !f || e.severity === f || e.kind === f);
+  return `<div class="page-head"><div><h1>Activity</h1><p class="muted">Deploys, errors and syncs across every app.</p></div><button class="btn" data-act="refresh" ${S.busy.refresh ? 'disabled' : ''}>${S.busy.refresh ? 'Checking…' : 'Refresh now'}</button></div>
+  <div class="row" style="margin-bottom:1rem">${[['', 'All'], ['critical', 'Critical'], ['warn', 'Warnings'], ['deploy', 'Deploys'], ['error', 'Errors']].map(([k, l]) => `<button class="btn sm ${f === k ? 'primary' : ''}" data-act="ev-filter" data-f="${k}">${l}</button>`).join('')}</div>
+  ${list.length ? `<div class="app-list">${list.map(eventRow).join('')}</div>` : `<div class="empty"><p class="muted">Nothing here yet. Deploys appear once the Vercel and Render tokens are connected (Settings → Connections); errors appear as soon as an app reports one.</p></div>`}`;
+}
+function eventRow(e) {
+  const a = byId(e.app_id);
+  return `<div class="item ev ${esc(e.severity)}"><div class="row" style="justify-content:space-between"><strong>${esc(e.title)}</strong><span class="small muted">${ago(e.created_at)}</span></div>
+    <p class="small">${a ? `<a href="#" data-act="open" data-id="${a.id}">${esc(a.name)}</a>` : 'Portfolio'} · ${esc(e.source)}</p>${e.detail ? `<p class="small muted">${esc(e.detail)}</p>` : ''}</div>`;
+}
+
+const LIVE_SUBS = ['active', 'trialing', 'past_due', 'on_trial'];
+function appMoney(a) {
+  const d30 = Date.now() - 30 * 864e5;
+  const r30 = sumBy(S.revenue.filter((r) => r.app_id === a.id && new Date(r.occurred_at).getTime() >= d30), (r) => [r.currency, r.amount_cents]);
+  const all = sumBy(S.revenue.filter((r) => r.app_id === a.id), (r) => [r.currency, r.amount_cents]);
+  const ex = sumBy(S.expenses.filter((x) => x.app_id === a.id && activeExpense(x)), (x) => [x.currency, monthlyCents(x)]);
+  const cs = S.customers.filter((c) => c.app_id === a.id);
+  const mrr = cs.reduce((t, c) => t + (LIVE_SUBS.includes(c.status) ? c.mrr_cents || 0 : 0), 0);
+  return { r30, all, ex, mrr, customers: cs.filter((c) => LIVE_SUBS.includes(c.status) || c.status === 'one_time').length, links: S.links.filter((l) => l.app_id === a.id) };
+}
+function minus(a, b) { const o = { ...a }; for (const [c, v] of Object.entries(b)) o[c] = (o[c] || 0) - v; return o; }
+function linkBadge(l) { return l.status === 'error' ? `<span class="pill h-down" title="${esc(l.last_error)}">${esc(l.provider)} · error</span>` : `<span class="pill live">${esc(l.provider)} ✓ ${ago(l.last_sync_at)}</span>`; }
+
+function moneyView() {
+  const d30 = Date.now() - 30 * 864e5;
+  const rev30 = sumBy(S.revenue.filter((r) => new Date(r.occurred_at).getTime() >= d30), (r) => [r.currency, r.amount_cents]);
+  const exp = sumBy(S.expenses.filter(activeExpense), (x) => [x.currency, monthlyCents(x)]);
+  const mrr = S.customers.reduce((t, c) => t + (LIVE_SUBS.includes(c.status) ? c.mrr_cents || 0 : 0), 0);
+  const active = S.customers.filter((c) => LIVE_SUBS.includes(c.status)).length;
+  const any = S.links.length > 0;
+  const card = (label, value, hint) => `<div class="stat-card"><span class="small muted">${label}</span><b>${value}</b>${hint ? `<span class="small muted">${hint}</span>` : ''}</div>`;
+  return `<div class="page-head"><div><h1>Money</h1><p class="muted">Revenue, customers and costs for every app, and the profit left over.</p></div>
+    <div class="row">${any ? `<button class="btn" data-act="pay-sync" ${S.busy.sync ? 'disabled' : ''}>${S.busy.sync ? 'Syncing…' : 'Sync payments'}</button>` : ''}<button class="btn primary" data-act="new-expense">Add expense</button></div></div>
+  ${any ? `<div class="panel warnbox" style="margin-bottom:1rem"><p class="small"><strong>Reminder:</strong> Vercel's free Hobby plan is for non-commercial use. Once an app takes payments, move to Vercel Pro (see Plans).</p></div>`
+    : `<div class="panel" style="margin-bottom:1rem"><h3>No app is connected to payments yet</h3><p class="muted small" style="margin-top:.3rem">When an app is ready to sell, press <strong>Connect</strong> next to it below and paste a read-only Stripe or Lemon Squeezy key. Sales, refunds, customers and subscriptions then fill in automatically.</p></div>`}
+  <div class="stat-grid">${card('Revenue, last 30 days', moneyMulti(rev30))}${card('Monthly recurring (MRR)', money(mrr, S.prefs.currency), 'from active subscriptions')}${card('Active customers', active)}${card('Expenses per month', moneyMulti(exp), 'recurring costs you entered')}${card('Profit, last 30 days', moneyMulti(minus(rev30, exp)), 'revenue minus monthly costs')}</div>
+  <h2 style="margin:1.5rem 0 .7rem">By app</h2>
+  <div class="table-wrap"><table><thead><tr><th>App</th><th>Payments</th><th>Revenue 30d</th><th>MRR</th><th>Customers</th><th>Costs / mo</th><th>Profit 30d</th></tr></thead><tbody>
+  ${S.apps.map((a) => { const m = appMoney(a); return `<tr><td><a href="#" data-act="open-tab" data-id="${a.id}" data-tab="money">${esc(a.name)}</a></td>
+    <td>${m.links.length ? m.links.map(linkBadge).join(' ') : `<button class="btn sm" data-act="pay-connect" data-app="${a.id}">Connect</button>`}</td>
+    <td>${moneyMulti(m.r30)}</td><td>${money(m.mrr, S.prefs.currency)}</td><td>${m.customers}</td><td>${moneyMulti(m.ex)}</td><td>${moneyMulti(minus(m.r30, m.ex))}</td></tr>`; }).join('')}
+  </tbody></table></div>
+  <h2 style="margin:1.5rem 0 .7rem">Expenses</h2>
+  ${S.expenses.length ? `<div class="table-wrap"><table><thead><tr><th>Vendor</th><th>For</th><th>Category</th><th>Amount</th><th>Billed</th><th>Dates</th><th></th></tr></thead><tbody>
+    ${S.expenses.map((x) => `<tr><td>${esc(x.vendor)}${x.note ? `<div class="small muted">${esc(x.note)}</div>` : ''}</td><td>${x.app_id ? esc(byId(x.app_id)?.name || '—') : 'All apps'}</td><td>${esc(x.category)}</td><td>${money(x.amount_cents, x.currency)}</td><td>${esc(x.cadence.replace('_', ' '))}</td><td class="small">${esc(x.starts_on)}${x.ends_on ? ' → ' + esc(x.ends_on) : ''}</td>
+      <td><button class="btn sm danger" data-act="del-expense" data-id="${x.id}">Delete</button></td></tr>`).join('')}</tbody></table></div>`
+    : `<p class="muted">No expenses yet. You're on free plans, so that's accurate. Add costs here when you upgrade anything or buy a domain.</p>`}`;
+}
+
+function plansView() {
+  const P = S.prefs.prices, m = (d) => money(Math.round(d * 100), 'usd');
+  const nApi = S.apps.filter((a) => a.backend_url).length || 14;
+  const svc = (label, amount, link) => `<li><span>${label}</span><span><b>${m(amount)}</b> <a class="btn sm" href="${link}" target="_blank" rel="noopener">Upgrade</a></span></li>`;
+  const packs = [
+    { name: 'Free', total: 0, now: true, when: 'Where you are now.', items: `<li><span>Vercel Hobby (non-commercial use only)</span><b>${m(0)}</b></li><li><span>Supabase Free (pauses after a week unused)</span><b>${m(0)}</b></li><li><span>Render Free × ${nApi} APIs (sleep when idle)</span><b>${m(0)}</b></li>` },
+    { name: 'Launch', total: P.vercelPro + P.supabasePro + P.renderStarter, when: 'When your first app starts selling.',
+      items: svc('Vercel Pro: required for commercial use', P.vercelPro, BILLING.vercel) + svc('Supabase Pro: no pausing, daily backups', P.supabasePro, BILLING.supabase) + svc('Render Starter × 1: the selling app never sleeps', P.renderStarter, BILLING.render) },
+    { name: 'Each extra selling app', total: P.renderStarter, when: 'Add one each time another app earns.', items: svc('Render Starter × 1', P.renderStarter, BILLING.render) },
+    { name: 'Full factory', total: P.vercelPro + P.supabasePro + P.renderStarter * nApi, when: `All ${nApi} APIs always on.`,
+      items: svc('Vercel Pro', P.vercelPro, BILLING.vercel) + svc('Supabase Pro', P.supabasePro, BILLING.supabase) + svc(`Render Starter × ${nApi}`, P.renderStarter * nApi, BILLING.render) },
+  ];
+  return `<div class="page-head"><div><h1>Plans &amp; costs</h1><p class="muted">What running your portfolio costs at each stage. Upgrade buttons open each company's own billing page; payment always happens there.</p></div></div>
+  <div class="plans">${packs.map((p) => `<div class="panel plan ${p.now ? 'current' : ''}"><div class="row" style="justify-content:space-between"><h2>${p.name}</h2>${p.now ? '<span class="pill live">Current</span>' : ''}</div>
+    <p class="plan-price">${m(p.total)}<span class="small muted"> / month</span></p><p class="small muted">${p.when}</p><ul class="plan-lines">${p.items}</ul></div>`).join('')}</div>
+  <div class="panel" style="margin-top:1rem"><h3>Claude (AI features)</h3><p class="small muted" style="margin-top:.3rem">Pay-as-you-go on your Anthropic account, used by the briefing, Ask Planet and Explain. Set a monthly spend limit so it can never surprise you.</p><div style="margin-top:.6rem"><a class="btn sm" href="${BILLING.anthropic}" target="_blank" rel="noopener">Set spend limit</a></div></div>
+  <p class="small muted" style="margin-top:1rem">Prices checked September 2026, before tax. Change them in Settings → Plan prices if a provider changes theirs. Once you upgrade, record the cost under Money → Add expense so profit stays accurate.</p>`;
+}
+
+function tabHealth(a) {
+  const row = (label, c) => `<div class="item"><div class="row" style="justify-content:space-between"><strong>${label}</strong><span class="pill h-${c ? c.state : 'unknown'}">${c ? esc(c.state) : 'not checked'}</span></div>${c ? `<p class="small muted">${ago(c.checked_at)}${c.ms ? ` · ${c.ms} ms` : ''}${c.detail ? ` · ${esc(c.detail)}` : ''}</p>` : ''}</div>`;
+  const ev = S.events.filter((e) => e.app_id === a.id).slice(0, 12);
+  return `<div class="stack">${a.frontend_url ? row('Website', latestCheck(a.id, 'website')) : ''}${a.backend_url ? row('API', latestCheck(a.id, 'api')) : ''}
+    <div><button class="btn sm" data-act="check-app" data-id="${a.id}" ${S.busy.check ? 'disabled' : ''}>${S.busy.check ? 'Checking…' : 'Check this app now'}</button></div>
+    <h3>Recent activity</h3>${ev.length ? ev.map(eventRow).join('') : '<p class="muted small">No deploys or errors recorded yet.</p>'}</div>`;
+}
+function tabMoney(a) {
+  const m = appMoney(a);
+  const has = (p) => m.links.find((l) => l.provider === p);
+  const prov = (p, label) => { const l = has(p); return l ? `<div class="item"><div class="row" style="justify-content:space-between"><strong>${label}</strong>${linkBadge(l)}</div><p class="small muted">${esc(l.account_label || '')}${l.last_error ? ` · ${esc(l.last_error)}` : ''}</p>
+      <div class="row"><button class="btn sm" data-act="pay-sync" data-app="${a.id}" ${S.busy.sync ? 'disabled' : ''}>Sync now</button><button class="btn sm" data-act="pay-connect" data-app="${a.id}" data-provider="${p}">Replace key</button><button class="btn sm danger" data-act="pay-disconnect" data-app="${a.id}" data-provider="${p}">Disconnect</button></div></div>`
+    : `<div class="item"><div class="row" style="justify-content:space-between"><strong>${label}</strong><span class="pill">Not connected</span></div><div><button class="btn sm primary" data-act="pay-connect" data-app="${a.id}" data-provider="${p}">Connect ${label}</button></div></div>`; };
+  return `<div class="stack"><dl class="kv"><dt>Revenue, 30 days</dt><dd>${moneyMulti(m.r30)}</dd><dt>Revenue, 400 days</dt><dd>${moneyMulti(m.all)}</dd><dt>MRR</dt><dd>${money(m.mrr, S.prefs.currency)}</dd><dt>Customers</dt><dd>${m.customers}</dd><dt>Costs per month</dt><dd>${moneyMulti(m.ex)}</dd><dt>Profit, 30 days</dt><dd>${moneyMulti(minus(m.r30, m.ex))}</dd></dl>
+    ${prov('stripe', 'Stripe')}${prov('lemonsqueezy', 'Lemon Squeezy')}
+    <div><button class="btn sm" data-act="new-expense" data-app="${a.id}">Add a cost for this app</button></div></div>`;
+}
+function tabKeys(a) {
+  const keys = S.keysByApp[a.id];
+  if (keys === undefined) {
+    if (!S.busy['k' + a.id]) {
+      S.busy['k' + a.id] = true;
+      brain('keys_list', { app_id: a.id }).then((r) => { S.keysByApp[a.id] = r.keys; }).catch((e) => { S.keysByApp[a.id] = null; S.keysErr = e.message; })
+        .finally(() => { S.busy['k' + a.id] = false; render(); });
+    }
+    return '<p class="muted">Loading keys…</p>';
+  }
+  if (keys === null) return `<p class="muted">Couldn't load keys: ${esc(S.keysErr || '')}</p><button class="btn sm" data-act="keys-reload" data-id="${a.id}">Try again</button>`;
+  return `<div class="stack"><p class="muted small">Keys let a customer's software call this app's API. Only a fingerprint is stored; each key is shown once, when you create it.</p>
+    <form class="row" data-form="key-create" data-id="${a.id}"><input name="label" placeholder="Who is this key for?" required style="flex:1 1 200px" /><label class="small muted" style="display:grid;gap:.2rem">Expires (optional)<input name="expires_at" type="date" style="width:auto" /></label><button class="btn primary">Create key</button></form>
+    ${keys.length ? `<div class="table-wrap"><table><thead><tr><th>For</th><th>Starts with</th><th>Status</th><th>Last used</th><th></th></tr></thead><tbody>
+      ${keys.map((k) => `<tr><td>${esc(k.label || '—')}</td><td class="code">${esc(k.key_prefix)}…</td><td>${k.active ? (k.expires_at && new Date(k.expires_at) < new Date() ? '<span class="pill">expired</span>' : '<span class="pill live">active</span>') : '<span class="pill">revoked</span>'}</td><td class="small">${ago(k.last_used_at)}</td>
+        <td>${k.active ? `<button class="btn sm danger" data-act="key-revoke" data-app="${a.id}" data-id="${k.id}">Revoke</button>` : ''}</td></tr>`).join('')}</tbody></table></div>` : '<p class="muted small">No keys yet.</p>'}</div>`;
+}
+
+function connectForm(appId, provider = 'stripe') {
+  const a = byId(appId);
+  modal(`<form class="stack" data-form="pay-connect"><h2>Connect payments: ${esc(a?.name || '')}</h2>
+    <input type="hidden" name="app_id" value="${esc(appId)}" />
+    <label class="field"><span>Provider</span><select name="provider" data-act="noop">${[['stripe', 'Stripe'], ['lemonsqueezy', 'Lemon Squeezy']].map(([v, l]) => `<option value="${v}" ${v === provider ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+    <details class="item"><summary><strong>How to get a safe, read-only key</strong></summary><div class="small" style="margin-top:.5rem;display:grid;gap:.4rem">
+      <p><strong>Stripe:</strong> Developers → API keys → <em>Create restricted key</em>. Give it <em>Read</em> access to Balance, Charges, Customers and Subscriptions; nothing else. It starts with <span class="code">rk_</span>.</p>
+      <p><strong>Lemon Squeezy:</strong> Settings → API → <em>Create API key</em>.</p>
+      <p>The key is checked with the provider, then encrypted on the server. Planet never shows it again, and your browser can't read it back.</p></div></details>
+    <label class="field"><span>API key</span><input name="api_key" type="password" required autocomplete="off" spellcheck="false" /></label>
+    <details class="item"><summary><strong>Several apps share one account?</strong> (optional)</summary><div class="stack" style="margin-top:.6rem">
+      <label class="row small"><input type="checkbox" name="metadata_app" value="${esc(a?.slug || '')}" style="width:auto" /> Stripe: only count sales whose metadata has <span class="code">app = ${esc(a?.slug || '')}</span></label>
+      <div class="grid-2"><label class="field"><span>Lemon Squeezy store ID</span><input name="store_id" inputmode="numeric" /></label><label class="field"><span>Lemon Squeezy product ID</span><input name="product_id" inputmode="numeric" /></label></div></div></details>
+    <p class="small muted">Reminder: taking payments means moving the website to Vercel Pro (Plans page).</p>
+    <div class="row"><button class="btn primary">Check key and connect</button><button type="button" class="btn ghost" data-act="close-modal-btn">Cancel</button></div></form>`);
+}
+function expenseForm(appId) {
+  modal(`<form class="stack" data-form="expense"><h2>Add an expense</h2>
+    <div class="grid-2"><label class="field"><span>Vendor</span><input name="vendor" required list="vendors" placeholder="Vercel, Render, Supabase…" /><datalist id="vendors">${['Vercel', 'Render', 'Supabase', 'Anthropic', 'Domain registrar', 'Stripe fees', 'Lemon Squeezy fees'].map((v) => `<option value="${v}">`).join('')}</datalist></label>
+    <label class="field"><span>For</span><select name="app_id">${appOptions(appId).replace('Shared / all apps', 'All apps (shared)')}</select></label>
+    <label class="field"><span>Category</span><select name="category">${['hosting', 'database', 'AI', 'domain', 'payments fees', 'tools', 'marketing', 'other'].map((c) => `<option>${c}</option>`).join('')}</select></label>
+    <label class="field"><span>Billed</span><select name="cadence"><option value="monthly">Monthly</option><option value="yearly">Yearly</option><option value="one_time">One time</option></select></label>
+    <label class="field"><span>Amount</span><input name="amount" type="number" step="0.01" min="0" required /></label>
+    <label class="field"><span>Currency</span><input name="currency" value="${esc(S.prefs.currency.toUpperCase())}" maxlength="3" /></label>
+    <label class="field"><span>Starts</span><input name="starts_on" type="date" value="${new Date().toISOString().slice(0, 10)}" /></label>
+    <label class="field"><span>Ends (optional)</span><input name="ends_on" type="date" /></label></div>
+    <label class="field"><span>Note</span><input name="note" /></label>
+    <div class="row"><button class="btn primary">Add expense</button><button type="button" class="btn ghost" data-act="close-modal-btn">Cancel</button></div></form>`);
+}
+function newKeyModal(k) {
+  modal(`<div class="stack"><h2>Key created</h2><p>Copy it now. <strong>It won't be shown again.</strong> Give it only to the person or system it's for.</p>
+    <div class="item"><span class="secret-val" id="newkey">${esc(k.key)}</span></div>
+    <div class="row"><button class="btn primary" data-act="copy-newkey">Copy key</button><button class="btn" data-act="close-modal-btn">Done</button></div>
+    <p class="small muted">Use it by sending the header <span class="code">X-API-Key</span> with each request to the app's API.</p></div>`);
+}
+
+// Runs when you open Planet: gentle checks (throttled by the brain) + today's briefing.
+async function autoRun() {
+  const a = S.prefs.automation;
+  try { S.brainStatus = await brain('status'); } catch (e) { S.brainStatus = { error: e.message }; }
+  render();
+  if (!S.apps.length) return;
+  if (a.refreshOnOpen) {
+    S.busy.refresh = true; render();
+    try { await brain('refresh_all', { check_every_hours: a.checkEveryHours }); await loadOps(); } catch (e) { console.warn(e); }
+    S.busy.refresh = false; render();
+  }
+  if (a.briefingOnOpen && S.brainStatus?.configured?.anthropic) {
+    S.busy.brief = true; render();
+    try { const r = await brain('briefing', {}); S.briefing = r.briefing; } catch (e) { console.warn(e); }
+    S.busy.brief = false; render();
+  }
+}
+
 // ---------- modals ----------
 function modal(html) { $('#modal-root').innerHTML = `<div class="modal" data-act="close-modal"><div class="modal-card" role="dialog" aria-modal="true" data-stop>${html}</div></div>`; $('#modal-root input, #modal-root textarea, #modal-root select')?.focus(); }
 function closeModal() { $('#modal-root').innerHTML = ''; }
@@ -376,6 +674,7 @@ function appForm(a = {}) {
     </div>
     <label class="field"><span>Tech (comma separated)</span><input name="tech" value="${esc((a.tech || []).join(', '))}" /></label>
     <label class="field"><span>Tags (comma separated)</span><input name="tags" value="${esc((a.tags || []).join(', '))}" /></label>
+    <label class="field"><span>AI permission level</span><select name="ai_level">${AI_LEVELS.map((l, i) => `<option value="${i}" ${(a.ai_level ?? 1) === i ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
     <div class="row"><button class="btn primary">${a.id ? 'Save app' : 'Add app'}</button><button type="button" class="btn ghost" data-act="close-modal-btn">Cancel</button></div></form>`);
 }
 function permForm(p = {}) {
@@ -496,6 +795,47 @@ const actions = {
   signout: async () => { await sb.auth.signOut(); S.vaultKey = null; },
   'close-modal': () => closeModal(),
   'close-modal-btn': () => closeModal(),
+  'open-tab': (d, e) => { e?.preventDefault(); S.openId = d.id; S.tab = d.tab || 'overview'; render(); },
+  refresh: async () => {
+    if (S.busy.refresh) return; S.busy.refresh = true; render();
+    try { const r = await brain('refresh_all', { force_checks: true, check_every_hours: S.prefs.automation.checkEveryHours }); await loadOps(); toast(`Checked ${typeof r.checks === 'number' ? r.checks + ' endpoints' : 'apps'}`); }
+    catch (e) { fail(e); } finally { S.busy.refresh = false; render(); }
+  },
+  'check-app': async (d) => {
+    S.busy.check = true; render();
+    try { await brain('run_checks', { app_id: d.id }); await loadOps(); toast('Checked'); } catch (e) { fail(e); } finally { S.busy.check = false; render(); }
+  },
+  explain: async (d) => {
+    S.busy.explain = true; render();
+    try { await brain('explain', { app_id: d.id }); await loadAll(); toast('Explanation ready'); } catch (e) { fail(e); } finally { S.busy.explain = false; render(); }
+  },
+  'brief-refresh': async () => {
+    S.busy.brief = true; render();
+    try { const r = await brain('briefing', { force: true }); S.briefing = r.briefing; } catch (e) { fail(e); } finally { S.busy.brief = false; render(); }
+  },
+  'ask-suggest': (d) => doAsk(d.q),
+  'chat-clear': async () => { if (!confirm('Clear the whole chat history?')) return; await brain('chat_clear'); S.chat = []; render(); },
+  'ev-filter': (d) => { S.evFilter = d.f; render(); },
+  'keys-reload': (d) => { delete S.keysByApp[d.id]; render(); },
+  'key-revoke': async (d) => {
+    if (!confirm('Revoke this key? Anything using it stops working within a minute.')) return;
+    try { await brain('keys_revoke', { app_id: d.app, key_id: d.id }); delete S.keysByApp[d.app]; render(); toast('Key revoked'); } catch (e) { fail(e); }
+  },
+  'copy-newkey': async () => { await navigator.clipboard.writeText($('#newkey')?.textContent || ''); toast('Key copied'); },
+  'pay-connect': (d) => connectForm(d.app, d.provider),
+  'pay-sync': async (d) => {
+    S.busy.sync = true; render();
+    try { const r = await brain('pay_sync', d.app ? { app_id: d.app } : {}); await loadOps(); const errs = r.results.filter((x) => x.error); toast(errs.length ? `Sync problem: ${errs[0].error}` : 'Payments synced'); }
+    catch (e) { fail(e); } finally { S.busy.sync = false; render(); }
+  },
+  'pay-disconnect': async (d) => {
+    if (!confirm(`Disconnect ${d.provider}? The stored key is deleted; past revenue stays.`)) return;
+    try { await brain('pay_disconnect', { app_id: d.app, provider: d.provider }); await loadOps(); render(); toast('Disconnected'); } catch (e) { fail(e); }
+  },
+  'new-expense': (d) => expenseForm(d.app),
+  'del-expense': async (d) => { if (confirm('Delete this expense?')) await mutate('planet_expenses', 'delete', null, d.id).catch(fail); },
+  'brain-status': async () => { try { S.brainStatus = await brain('status'); render(); toast('Connections checked'); } catch (e) { fail(e); } },
+
 };
 
 const forms = {
@@ -513,7 +853,7 @@ const forms = {
     else msg.textContent = '';
   },
   app: async (fd, f) => {
-    const o = Object.fromEntries(fd); o.tech = csv(o.tech); o.tags = csv(o.tags); o.category = o.category || 'Uncategorised';
+    const o = Object.fromEntries(fd); o.tech = csv(o.tech); o.tags = csv(o.tags); o.category = o.category || 'Uncategorised'; o.ai_level = Number(o.ai_level ?? 1);
     for (const k of ['frontend_url', 'backend_url']) if (!o[k]) o[k] = null;
     const id = f.dataset.id;
     await mutate('planet_apps', id ? 'update' : 'insert', o, id);
@@ -555,6 +895,38 @@ const forms = {
     const a = byId(f.dataset.id); const custom = { ...(a.custom || {}) };
     for (const fld of S.prefs.fields) custom[fld.key] = fd.get('f_' + fld.key) || '';
     await mutate('planet_apps', 'update', { custom }, a.id); toast('Fields saved');
+  },
+  ask: async (fd) => { await doAsk(fd.get('q')); },
+  'key-create': async (fd, f) => {
+    const r = await brain('keys_create', { app_id: f.dataset.id, label: fd.get('label'), expires_at: fd.get('expires_at') || undefined });
+    delete S.keysByApp[f.dataset.id]; render(); newKeyModal(r);
+  },
+  'pay-connect': async (fd, f) => {
+    const filter = {};
+    if (fd.get('metadata_app')) filter.metadata_app = fd.get('metadata_app');
+    if (fd.get('store_id')) filter.store_id = fd.get('store_id').trim();
+    if (fd.get('product_id')) filter.product_id = fd.get('product_id').trim();
+    const body = { app_id: fd.get('app_id'), provider: fd.get('provider'), api_key: fd.get('api_key'), filter };
+    f.querySelector('[name=api_key]').value = '';   // don't leave the key sitting in the page
+    toast('Checking the key with the provider…');
+    const r = await brain('pay_connect', body);
+    closeModal(); await loadOps(); render();
+    const s = Array.isArray(r.synced) ? r.synced[0] : r.synced;
+    toast(s?.error ? `Connected, but the first sync failed: ${s.error}` : `Connected: ${r.link.account_label}`);
+  },
+  expense: async (fd) => {
+    const o = Object.fromEntries(fd);
+    await mutate('planet_expenses', 'insert', { vendor: o.vendor, app_id: o.app_id || null, category: o.category, cadence: o.cadence,
+      amount_cents: Math.round(parseFloat(o.amount) * 100), currency: (o.currency || 'usd').toLowerCase(), starts_on: o.starts_on || undefined, ends_on: o.ends_on || null, note: o.note || null });
+    closeModal(); toast('Expense added');
+  },
+  automation: async (fd) => {
+    await savePrefs({ automation: { refreshOnOpen: !!fd.get('refreshOnOpen'), briefingOnOpen: !!fd.get('briefingOnOpen'), checkEveryHours: Math.max(1, Number(fd.get('checkEveryHours')) || 6) } });
+    render(); toast('Automation saved');
+  },
+  prices: async (fd) => {
+    await savePrefs({ prices: { vercelPro: +fd.get('vercelPro') || 0, supabasePro: +fd.get('supabasePro') || 0, renderStarter: +fd.get('renderStarter') || 0 }, currency: (fd.get('currency') || 'usd').toLowerCase() });
+    render(); toast('Prices saved');
   },
   prefs: async (fd) => { await savePrefs({ theme: fd.get('theme'), categories: csv(fd.get('categories')), statuses: csv(fd.get('statuses')), liveStatuses: csv(fd.get('liveStatuses')) }); render(); toast('Settings saved'); },
   field: async (fd) => {
@@ -624,6 +996,7 @@ async function onSession(session) {
   if (!session) { S.vaultKey = null; render(); return; }
   try { await loadAll(); } catch (e) { fail(e); }
   render();
+  autoRun();
   setTimeout(() => { S._revealed = true; }, 1500);
 }
 // Surface errors Supabase returns in the address bar after an email link (e.g. expired link).

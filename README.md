@@ -27,3 +27,9 @@ Afterwards set `VITE_API_URL` on each Vercel frontend to its `https://<app>-api.
 
 ## Known backlog
 - Template backend accepts any `X-API-Key` (demo placeholder in server.ts). Replace with real key lookup before handling customer data.
+
+## Phase A: operations centre (brain + monitoring + AI + money)
+- **Brain:** Supabase Edge Function `planet-brain` (source in `supabase/functions/planet-brain/index.ts`, deployed separately; `.vercelignore` keeps it off Vercel).
+  Secrets (Supabase → Edge Functions → Secrets): `ANTHROPIC_API_KEY`, `VERCEL_TOKEN`, `RENDER_API_KEY`, optional `GITHUB_TOKEN`, optional `PLANET_MODEL`.
+- **Screens:** health rings on the orbit, daily briefing, Ask Planet, Activity, Money (Connect payments per app, expenses, profit), Plans & costs, per-app Health / Money / API keys tabs, Automation + Connections in Settings.
+- **Payments:** Stripe (restricted read-only key) or Lemon Squeezy, stored encrypted server-side, synced on open or on demand.
