@@ -1,0 +1,341 @@
+# Render Blueprint: creates the backend API for all 14 XAG apps in one go.
+# Render -> New -> Blueprint -> pick the planet-of-the-apps repo.
+# You'll be asked ONCE for SUPABASE_SERVICE_ROLE_KEY (shared group below).
+# API_ADMIN_KEY / API_ADMIN_PIN are generated randomly by Render per service.
+
+envVarGroups:
+  - name: xag-shared
+    envVars:
+      - key: SUPABASE_URL
+        value: https://iwpfhalextbzbvcajtxu.supabase.co
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: NODE_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: info
+      - key: ERROR_ALERT_EMAIL
+        value: xaglobally@gmail.com
+
+services:
+  - type: web
+    name: reputationpilot-med-spas-api
+    runtime: node
+    plan: free
+    region: singapore
+    repo: https://github.com/xaglobally-lgtm/reputationpilot-med-spas
+    branch: main
+    rootDir: backend
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - fromGroup: xag-shared
+      - key: APP_NAME
+        value: reputationpilot-med-spas
+      - key: ALLOWED_ORIGINS
+        value: https://reputationpilot-med-spas.vercel.app
+      - key: API_ADMIN_KEY
+        generateValue: true
+      - key: API_ADMIN_PIN
+        generateValue: true
+
+  - type: web
+    name: quoteflow-home-builders-api
+    runtime: node
+    plan: free
+    region: singapore
+    repo: https://github.com/xaglobally-lgtm/quoteflow-home-builders
+    branch: main
+    rootDir: backend
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - fromGroup: xag-shared
+      - key: APP_NAME
+        value: quoteflow-home-builders
+      - key: ALLOWED_ORIGINS
+        value: https://quoteflow-home-builders.vercel.app
+      - key: API_ADMIN_KEY
+        generateValue: true
+      - key: API_ADMIN_PIN
+        generateValue: true
+
+  - type: web
+    name: complytrack-hvac-contractors-api
+    runtime: node
+    plan: free
+    region: singapore
+    repo: https://github.com/xaglobally-lgtm/complytrack-hvac-contractors
+    branch: main
+    rootDir: backend
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - fromGroup: xag-shared
+      - key: APP_NAME
+        value: complytrack-hvac-contractors
+      - key: ALLOWED_ORIGINS
+        value: https://complytrack-hvac-contractors.vercel.app
+      - key: API_ADMIN_KEY
+        generateValue: true
+      - key: API_ADMIN_PIN
+        generateValue: true
+
+  - type: web
+    name: pipelinedesk-insurance-agents-api
+    runtime: node
+    plan: free
+    region: singapore
+    repo: https://github.com/xaglobally-lgtm/pipelinedesk-insurance-agents
+    branch: main
+    rootDir: backend
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - fromGroup: xag-shared
+      - key: APP_NAME
+        value: pipelinedesk-insurance-agents
+      - key: ALLOWED_ORIGINS
+        value: https://pipelinedesk-insurance-agents.vercel.app
+      - key: API_ADMIN_KEY
+        generateValue: true
+      - key: API_ADMIN_PIN
+        generateValue: true
+
+  - type: web
+    name: memberflow-personal-trainers-api
+    runtime: node
+    plan: free
+    region: singapore
+    repo: https://github.com/xaglobally-lgtm/memberflow-personal-trainers
+    branch: main
+    rootDir: backend
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - fromGroup: xag-shared
+      - key: APP_NAME
+        value: memberflow-personal-trainers
+      - key: ALLOWED_ORIGINS
+        value: https://memberflow-personal-trainers.vercel.app
+      - key: API_ADMIN_KEY
+        generateValue: true
+      - key: API_ADMIN_PIN
+        generateValue: true
+
+  - type: web
+    name: xag-dispute-arbiter-api
+    runtime: node
+    plan: free
+    region: singapore
+    repo: https://github.com/xaglobally-lgtm/xag-dispute-arbiter
+    branch: main
+    rootDir: backend
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - fromGroup: xag-shared
+      - key: APP_NAME
+        value: xag-dispute-arbiter
+      - key: ALLOWED_ORIGINS
+        value: https://xag-dispute-arbiter.vercel.app
+      - key: API_ADMIN_KEY
+        generateValue: true
+      - key: API_ADMIN_PIN
+        generateValue: true
+
+  - type: web
+    name: xag-spend-guardian-api
+    runtime: node
+    plan: free
+    region: singapore
+    repo: https://github.com/xaglobally-lgtm/xag-spend-guardian
+    branch: main
+    rootDir: backend
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - fromGroup: xag-shared
+      - key: APP_NAME
+        value: xag-spend-guardian
+      - key: ALLOWED_ORIGINS
+        value: https://xag-spend-guardian.vercel.app
+      - key: API_ADMIN_KEY
+        generateValue: true
+      - key: API_ADMIN_PIN
+        generateValue: true
+
+  - type: web
+    name: xag-webhook-promise-monitor-api
+    runtime: node
+    plan: free
+    region: singapore
+    repo: https://github.com/xaglobally-lgtm/xag-webhook-promise-monitor
+    branch: main
+    rootDir: backend
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - fromGroup: xag-shared
+      - key: APP_NAME
+        value: xag-webhook-promise-monitor
+      - key: ALLOWED_ORIGINS
+        value: https://xag-webhook-promise-monitor.vercel.app
+      - key: API_ADMIN_KEY
+        generateValue: true
+      - key: API_ADMIN_PIN
+        generateValue: true
+
+  - type: web
+    name: xag-schema-contract-guard-api
+    runtime: node
+    plan: free
+    region: singapore
+    repo: https://github.com/xaglobally-lgtm/xag-schema-contract-guard
+    branch: main
+    rootDir: backend
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - fromGroup: xag-shared
+      - key: APP_NAME
+        value: xag-schema-contract-guard
+      - key: ALLOWED_ORIGINS
+        value: https://xag-schema-contract-guard.vercel.app
+      - key: API_ADMIN_KEY
+        generateValue: true
+      - key: API_ADMIN_PIN
+        generateValue: true
+
+  - type: web
+    name: xag-replay-attack-detector-api
+    runtime: node
+    plan: free
+    region: singapore
+    repo: https://github.com/xaglobally-lgtm/xag-replay-attack-detector
+    branch: main
+    rootDir: backend
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - fromGroup: xag-shared
+      - key: APP_NAME
+        value: xag-replay-attack-detector
+      - key: ALLOWED_ORIGINS
+        value: https://xag-replay-attack-detector.vercel.app
+      - key: API_ADMIN_KEY
+        generateValue: true
+      - key: API_ADMIN_PIN
+        generateValue: true
+
+  - type: web
+    name: xag-cost-anomaly-meter-api
+    runtime: node
+    plan: free
+    region: singapore
+    repo: https://github.com/xaglobally-lgtm/xag-cost-anomaly-meter
+    branch: main
+    rootDir: backend
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - fromGroup: xag-shared
+      - key: APP_NAME
+        value: xag-cost-anomaly-meter
+      - key: ALLOWED_ORIGINS
+        value: https://xag-cost-anomaly-meter.vercel.app
+      - key: API_ADMIN_KEY
+        generateValue: true
+      - key: API_ADMIN_PIN
+        generateValue: true
+
+  - type: web
+    name: xag-delegation-expiry-watch-api
+    runtime: node
+    plan: free
+    region: singapore
+    repo: https://github.com/xaglobally-lgtm/xag-delegation-expiry-watch
+    branch: main
+    rootDir: backend
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - fromGroup: xag-shared
+      - key: APP_NAME
+        value: xag-delegation-expiry-watch
+      - key: ALLOWED_ORIGINS
+        value: https://xag-delegation-expiry-watch.vercel.app
+      - key: API_ADMIN_KEY
+        generateValue: true
+      - key: API_ADMIN_PIN
+        generateValue: true
+
+  - type: web
+    name: xag-escrow-signal-api
+    runtime: node
+    plan: free
+    region: singapore
+    repo: https://github.com/xaglobally-lgtm/xag-escrow-signal
+    branch: main
+    rootDir: backend
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - fromGroup: xag-shared
+      - key: APP_NAME
+        value: xag-escrow-signal
+      - key: ALLOWED_ORIGINS
+        value: https://xag-escrow-signal.vercel.app
+      - key: API_ADMIN_KEY
+        generateValue: true
+      - key: API_ADMIN_PIN
+        generateValue: true
+
+  - type: web
+    name: xag-capability-sla-bond-api
+    runtime: node
+    plan: free
+    region: singapore
+    repo: https://github.com/xaglobally-lgtm/xag-capability-sla-bond
+    branch: main
+    rootDir: backend
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - fromGroup: xag-shared
+      - key: APP_NAME
+        value: xag-capability-sla-bond
+      - key: ALLOWED_ORIGINS
+        value: https://xag-capability-sla-bond.vercel.app
+      - key: API_ADMIN_KEY
+        generateValue: true
+      - key: API_ADMIN_PIN
+        generateValue: true
