@@ -251,7 +251,7 @@ function secretsTable(list) {
 
 function vaultView() {
   return `<div class="page-head"><div><h1>Codes &amp; keys</h1><p class="muted">API keys, PINs and passwords for every app, encrypted before they leave this device.</p></div>
-    <button class="btn primary" data-act="new-secret" ${S.vaultKey ? '' : 'disabled'}>Add code</button></div>
+    <div class="row"><button class="btn" data-act="bulk-secret" ${S.vaultKey ? '' : 'disabled'}>Paste many</button><button class="btn primary" data-act="new-secret" ${S.vaultKey ? '' : 'disabled'}>Add code</button></div></div>
     <div class="stack">${vaultBanner()}${secretsTable(S.secrets)}</div>`;
 }
 
@@ -327,7 +327,7 @@ function tabAccess(a) {
     ${list.length ? list.map((p) => `<div class="item"><div class="row" style="justify-content:space-between"><strong>${esc(p.service)}</strong><span class="pill">${esc(p.level)}</span></div>${p.scope ? `<p>${esc(p.scope)}</p>` : ''}${p.granted_to ? `<p class="small muted">Held by ${esc(p.granted_to)}</p>` : ''}${p.notes ? `<p class="small">${esc(p.notes)}</p>` : ''}<div class="row"><button class="btn sm" data-act="edit-perm" data-id="${p.id}">Edit</button><button class="btn sm danger" data-act="del-perm" data-id="${p.id}">Delete</button></div></div>`).join('') : '<p class="muted">None recorded yet.</p>'}</div>`;
 }
 function tabCodes(a) {
-  return `<div class="stack">${vaultBanner()}<div class="row" style="justify-content:space-between"><p class="muted">Keys and passwords for this app.</p><button class="btn sm primary" data-act="new-secret" data-app="${a.id}" ${S.vaultKey ? '' : 'disabled'}>Add code</button></div>${secretsTable(S.secrets.filter((s) => s.app_id === a.id))}</div>`;
+  return `<div class="stack">${vaultBanner()}<div class="row" style="justify-content:space-between"><p class="muted">Keys and passwords for this app.</p><div class="row"><button class="btn sm" data-act="bulk-secret" data-app="${a.id}" ${S.vaultKey ? '' : 'disabled'}>Paste many</button><button class="btn sm primary" data-act="new-secret" data-app="${a.id}" ${S.vaultKey ? '' : 'disabled'}>Add code</button></div></div>${secretsTable(S.secrets.filter((s) => s.app_id === a.id))}</div>`;
 }
 function tabNotes(a) {
   const list = S.items.filter((i) => i.app_id === a.id);
@@ -410,6 +410,41 @@ function secretForm(appId) {
     <div class="row"><button class="btn primary">Encrypt and save</button><button type="button" class="btn ghost" data-act="close-modal-btn">Cancel</button></div></form>`);
 }
 
+// Bulk paste: KEY=value lines (a .env file, or Render's Environment export) -> review -> encrypt.
+const PUBLIC_KEYS = new Set(['APP_NAME', 'NODE_ENV', 'LOG_LEVEL', 'PORT', 'SUPABASE_URL', 'ALLOWED_ORIGINS', 'ERROR_ALERT_EMAIL', 'EMAIL_SERVICE', 'EMAIL_FROM', 'SMTP_HOST', 'SMTP_PORT', 'DEBUG', 'MAINTENANCE_MODE', 'VITE_API_URL']);
+function parseEnv(text) {
+  const out = [];
+  for (let line of String(text).split(/\r?\n/)) {
+    line = line.trim();
+    if (!line || line.startsWith('#')) continue;
+    line = line.replace(/^export\s+/, '');
+    let m = line.match(/^([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*(.*)$/) || line.match(/^([A-Za-z_][A-Za-z0-9_.-]*)(?:\t+|\s{2,})(.+)$/);
+    if (!m) continue;
+    let v = m[2].trim();
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    if (v) out.push({ key: m[1], value: v });
+  }
+  return out;
+}
+function bulkForm(appId) {
+  const a = byId(appId);
+  modal(`<form class="stack" data-form="bulk-parse"><h2>Paste many codes</h2>
+    <p class="muted">Paste lines like <span class="code">KEY=value</span>, e.g. a .env file or the Export from a Render service's Environment page. You'll review the list before anything is saved.</p>
+    <div class="grid-2"><label class="field"><span>App</span><select name="app_id">${appOptions(appId)}</select></label>
+    <label class="field"><span>Used in</span><input name="where_used" value="${a ? esc('Render backend ' + (a.render_service || a.slug)) : ''}" placeholder="e.g. Render backend env" /></label></div>
+    <label class="field"><span>Paste here</span><textarea name="text" class="code" rows="10" required autocomplete="off" spellcheck="false"></textarea></label>
+    <div class="row"><button class="btn primary">Review</button><button type="button" class="btn ghost" data-act="close-modal-btn">Cancel</button></div></form>`);
+}
+function bulkReview() {
+  const b = S._bulk; const a = byId(b.app_id);
+  modal(`<form class="stack" data-form="bulk-save"><h2>Review ${b.rows.length} found</h2>
+    <p class="muted">Saving to <strong>${a ? esc(a.name) : 'Shared / all apps'}</strong>. Public settings are unticked. Values stay hidden and are encrypted on this device.</p>
+    <div class="table-wrap"><table><thead><tr><th>Save</th><th>Variable</th><th>Value</th></tr></thead><tbody>
+    ${b.rows.map((r, i) => { const exists = S.secrets.some((s) => s.app_id === (b.app_id || null) && s.env_name === r.key); return `<tr><td><input type="checkbox" name="k" value="${i}" ${PUBLIC_KEYS.has(r.key) ? '' : 'checked'} style="width:auto" aria-label="Save ${esc(r.key)}" /></td><td class="code">${esc(r.key)}${exists ? ' <span class="pill">replaces saved</span>' : ''}${PUBLIC_KEYS.has(r.key) ? ' <span class="pill">public</span>' : ''}</td><td class="secret-val">${'•'.repeat(Math.min(12, r.value.length))}</td></tr>`; }).join('')}
+    </tbody></table></div>
+    <div class="row"><button class="btn primary">Encrypt and save selected</button><button type="button" class="btn ghost" data-act="close-modal-btn">Cancel</button></div></form>`);
+}
+
 // ---------- actions ----------
 const actions = {
   nav: (d) => { S.page = d.page; localStorage.setItem('planet.page', S.page); render(); window.scrollTo(0, 0); },
@@ -431,6 +466,7 @@ const actions = {
   'del-item': async (d) => { if (confirm('Delete this entry?')) await mutate('planet_items', 'delete', null, d.id).catch(fail); },
   'copy-item': async (d) => { await navigator.clipboard.writeText(S.items.find((i) => i.id === d.id).body || ''); toast('Copied'); },
   'new-secret': (d) => secretForm(d.app),
+  'bulk-secret': (d) => bulkForm(d.app),
   reveal: async (d) => { if (S.revealed[d.id] != null) { delete S.revealed[d.id]; return render(); } const s = S.secrets.find((x) => x.id === d.id); try { S.revealed[d.id] = await decrypt(S.vaultKey, s.ciphertext, s.iv); render(); } catch { toast('Could not decrypt this code with the current passphrase'); } },
   'copy-secret': async (d) => { const s = S.secrets.find((x) => x.id === d.id); try { await navigator.clipboard.writeText(await decrypt(S.vaultKey, s.ciphertext, s.iv)); toast('Copied. Clipboard holds a secret now'); } catch { toast('Could not copy this code'); } },
   'del-secret': async (d) => { if (confirm('Delete this code permanently?')) await mutate('planet_secrets', 'delete', null, d.id).catch(fail); },
@@ -490,6 +526,30 @@ const forms = {
     const o = Object.fromEntries(fd); const { ciphertext, iv } = await encrypt(S.vaultKey, o.value);
     await mutate('planet_secrets', 'insert', { app_id: o.app_id || null, label: o.label, env_name: o.env_name, where_used: o.where_used, ciphertext, iv });
     closeModal(); toast('Code encrypted and saved');
+  },
+  'bulk-parse': async (fd) => {
+    if (!S.vaultKey) return toast('Unlock the vault first');
+    const rows = parseEnv(fd.get('text'));
+    if (!rows.length) return toast('No KEY=value lines found');
+    S._bulk = { app_id: fd.get('app_id') || null, where_used: fd.get('where_used') || '', rows };
+    bulkReview();
+  },
+  'bulk-save': async (fd) => {
+    const b = S._bulk; if (!b || !S.vaultKey) return;
+    const picked = fd.getAll('k').map((i) => b.rows[+i]);
+    if (!picked.length) return toast('Nothing selected');
+    let added = 0, replaced = 0;
+    for (const r of picked) {
+      const enc = await encrypt(S.vaultKey, r.value);
+      const old = S.secrets.find((s) => s.app_id === b.app_id && s.env_name === r.key);
+      const q = old
+        ? sb.from('planet_secrets').update({ ...enc, where_used: b.where_used || old.where_used, updated_at: new Date().toISOString() }).eq('id', old.id)
+        : sb.from('planet_secrets').insert({ app_id: b.app_id, label: r.key, env_name: r.key, where_used: b.where_used, ...enc });
+      const { error } = await q; if (error) throw error;
+      old ? replaced++ : added++;
+    }
+    S._bulk = null; closeModal(); await loadAll(); render();
+    toast(`${added} added${replaced ? `, ${replaced} replaced` : ''}. All encrypted`);
   },
   custom: async (fd, f) => {
     const a = byId(f.dataset.id); const custom = { ...(a.custom || {}) };
