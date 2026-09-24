@@ -149,7 +149,7 @@ function authView() {
     <label class="field"><span>Password</span><input name="password" type="password" autocomplete="current-password" minlength="8" /></label>
     <div class="row"><button class="btn primary" name="mode" value="signin">Sign in</button><button class="btn" name="mode" value="signup">Create account</button></div>
     <button class="btn ghost sm" name="mode" value="magic">Email me a sign-in link instead</button>
-    <p class="small muted" id="auth-msg"></p>
+    <p class="small" id="auth-msg" role="alert">${esc(S.authMsg || '')}</p>
   </form></div>`;
 }
 
@@ -458,7 +458,7 @@ const forms = {
     else if (!password || password.length < 8) { msg.textContent = 'Enter a password of at least 8 characters, or use the sign-in link.'; return; }
     else if (mode === 'signup') r = await sb.auth.signUp({ email, password, options: { emailRedirectTo: location.origin } });
     else r = await sb.auth.signInWithPassword({ email, password });
-    if (r.error) msg.textContent = r.error.message;
+    if (r.error) msg.textContent = /invalid login/i.test(r.error.message) ? `Email or password not recognised. Check the exact email you signed up with (${email}), or use the sign-in link below.` : /not confirmed/i.test(r.error.message) ? 'Your email is not confirmed yet. Use the link in the confirmation email, or send yourself a sign-in link below.' : r.error.message;
     else if (mode === 'magic') msg.textContent = 'Check your email for the sign-in link.';
     else if (mode === 'signup' && !r.data.session) msg.textContent = 'Account created. Confirm it from the email we sent, then sign in.';
     else msg.textContent = '';
@@ -553,6 +553,9 @@ async function onSession(session) {
   render();
   setTimeout(() => { S._revealed = true; }, 1500);
 }
+// Surface errors Supabase returns in the address bar after an email link (e.g. expired link).
+{ const h = new URLSearchParams(location.hash.slice(1) || location.search.slice(1)); const err = h.get('error_description') || h.get('error');
+  if (err) { S.authMsg = `That email link didn't work: ${err.replace(/\+/g, ' ')}. Sign in with your password, or send yourself a new sign-in link.`; history.replaceState(null, '', location.pathname); } }
 let booted = false;
 sb.auth.onAuthStateChange((_evt, session) => {
   const changed = (session?.user?.id || null) !== (S.session?.user?.id || null);
