@@ -35,7 +35,7 @@ const DEFAULT_PREFS = {
     { key: 'price', label: 'Price / plan', type: 'text' },
     { key: 'launch_date', label: 'Launch date', type: 'date' },
   ],
-  automation: { refreshOnOpen: true, checkEveryHours: 6, briefingOnOpen: true, aiDiagnosis: true },
+  automation: { refreshOnOpen: true, checkEveryHours: 6, briefingOnOpen: true, aiDiagnosis: true, autoRollback: true, briefingHour: 7 },
   prices: { vercelPro: 20, supabasePro: 25, renderStarter: 7 },
   currency: 'usd',
 };
@@ -80,7 +80,7 @@ const S = {
   page: localStorage.getItem('planet.page') || 'orbit', q: '', cat: '', status: '', sort: 'name',
   openId: null, tab: 'overview', focusCat: '', vaultKey: null, revealed: {}, installPrompt: null,
   checks: [], events: [], briefing: null, chat: [], links: [], revenue: [], customers: [], expenses: [],
-  brainStatus: null, busy: {}, keysByApp: {}, newKey: null, evFilter: '',
+  brainStatus: null, busy: {}, keysByApp: {}, newKey: null, evFilter: '', deployState: [],
 };
 
 // ---------- helpers ----------
@@ -96,6 +96,7 @@ function health(a) {
   const w = latestCheck(a.id, 'website'), p = latestCheck(a.id, 'api');
   const hourAgo = Date.now() - 3600e3;
   if (S.events.some((e) => e.app_id === a.id && e.severity === 'critical' && e.kind === 'error' && new Date(e.last_seen || e.created_at).getTime() >= hourAgo)) return 'down';
+  if (S.deployState.some((d) => d.app_id === a.id && d.status === 'failed')) return 'down';
   if (!w && !p) return 'unknown';
   if ((w && w.state === 'down') || (p && p.state === 'down')) return 'down';
   if (p && p.state === 'asleep') return 'asleep';
@@ -159,10 +160,11 @@ async function loadOps() {
     sb.from('planet_revenue').select('*').gte('occurred_at', since).order('occurred_at', { ascending: false }).limit(5000),
     sb.from('planet_customers').select('*'),
     sb.from('planet_expenses').select('*').order('created_at'),
+    sb.from('planet_deploy_state').select('*'),
   ]);
-  const [checks, events, briefing, chat, links, revenue, customers, expenses] = res.map((r) => { if (r.error) { console.warn(r.error); return { data: null }; } return r; });
+  const [checks, events, briefing, chat, links, revenue, customers, expenses, deployState] = res.map((r) => { if (r.error) { console.warn(r.error); return { data: null }; } return r; });
   S.checks = checks.data || []; S.events = events.data || []; S.briefing = briefing.data || null; S.chat = chat.data || [];
-  S.links = links.data || []; S.revenue = revenue.data || []; S.customers = customers.data || []; S.expenses = expenses.data || [];
+  S.links = links.data || []; S.revenue = revenue.data || []; S.customers = customers.data || []; S.expenses = expenses.data || []; S.deployState = deployState.data || [];
 }
 async function savePrefs(patch) {
   S.prefs = { ...S.prefs, ...patch };
@@ -357,8 +359,11 @@ function settingsView() {
       <label class="row"><input type="checkbox" name="refreshOnOpen" ${S.prefs.automation.refreshOnOpen ? 'checked' : ''} style="width:auto" /> Check health, deploys, errors and payments when I open Planet</label>
       <label class="field"><span>Check each app at most every … hours (wakes sleeping free services, so keep this gentle)</span><input name="checkEveryHours" type="number" min="1" max="72" value="${esc(S.prefs.automation.checkEveryHours)}" style="max-width:8rem" /></label>
       <label class="row"><input type="checkbox" name="briefingOnOpen" ${S.prefs.automation.briefingOnOpen ? 'checked' : ''} style="width:auto" /> Write my daily briefing (at most once every 20 hours)</label>
-      <label class="row"><input type="checkbox" name="aiDiagnosis" ${S.prefs.automation.aiDiagnosis ? 'checked' : ''} style="width:auto" /> Diagnose serious or repeated errors with AI automatically (up to 2 per refresh; only apps at AI level Recommend or higher)</label>
-      <p class="small muted">AI fixes and automatic deploys are switched off. They arrive in a later phase as proposals you approve, never automatic changes.</p>
+      <label class="row"><input type="checkbox" name="aiDiagnosis" ${S.prefs.automation.aiDiagnosis ? 'checked' : ''} style="width:auto" /> Diagnose serious or repeated errors with AI automatically (up to 2 per run, 10 per day; only apps at AI level Recommend or higher)</label>
+      <label class="row"><input type="checkbox" name="autoRollback" ${S.prefs.automation.autoRollback !== false ? 'checked' : ''} style="width:auto" /> Auto-rollback: if a new version fails its health checks twice, switch back to the last working version</label>
+      <label class="field"><span>Morning briefing is ready from (hour, your time zone: ${esc(S.prefs.tz || 'not set yet')})</span><input name="briefingHour" type="number" min="0" max="23" value="${esc(S.prefs.automation.briefingHour ?? 7)}" style="max-width:8rem" /></label>
+      <p class="small muted">These run every 10 minutes on the server, even when Planet is closed. The briefing arrives once a day.</p>
+      <p class="small muted">AI-written fixes are not switched on. They arrive in a later phase as proposals you approve, never automatic changes.</p>
       <div><button class="btn primary">Save automation</button></div>
     </form>
     <form class="panel stack" data-form="prices">
@@ -494,7 +499,7 @@ function activityView() {
   const f = S.evFilter;
   const list = S.events.filter((e) => !f || e.severity === f || e.kind === f || e.source === f);
   return `<div class="page-head"><div><h1>Activity</h1><p class="muted">Errors, slow responses and deploys across every app. Repeats are grouped per day.</p></div><button class="btn" data-act="refresh" ${S.busy.refresh ? 'disabled' : ''}>${S.busy.refresh ? 'Checking…' : 'Refresh now'}</button></div>
-  <div class="row" style="margin-bottom:1rem">${[['', 'All'], ['critical', 'Serious'], ['error', 'Errors'], ['browser', 'Website'], ['slow', 'Slow'], ['deploy', 'Deploys']].map(([k, l]) => `<button class="btn sm ${f === k ? 'primary' : ''}" data-act="ev-filter" data-f="${k}">${l}</button>`).join('')}</div>
+  <div class="row" style="margin-bottom:1rem">${[['', 'All'], ['critical', 'Serious'], ['error', 'Errors'], ['browser', 'Website'], ['slow', 'Slow'], ['deploy', 'Deploys'], ['rollback', 'Rollbacks']].map(([k, l]) => `<button class="btn sm ${f === k ? 'primary' : ''}" data-act="ev-filter" data-f="${k}">${l}</button>`).join('')}</div>
   ${list.length ? `<div class="app-list">${list.map(eventRow).join('')}</div>` : `<div class="empty"><p class="muted">Nothing here yet. Deploys appear once the Vercel and Render tokens are connected (Settings → Connections); errors appear as soon as an app reports one.</p></div>`}`;
 }
 const SOURCE_LABEL = { backend: 'API', browser: 'website', vercel: 'Vercel', render: 'Render', payments: 'payments', ai: 'AI' };
@@ -571,7 +576,25 @@ function tabHealth(a) {
   const ev = S.events.filter((e) => e.app_id === a.id).slice(0, 12);
   return `<div class="stack">${a.frontend_url ? row('Website', latestCheck(a.id, 'website')) : ''}${a.backend_url ? row('API', latestCheck(a.id, 'api')) : ''}
     <div><button class="btn sm" data-act="check-app" data-id="${a.id}" ${S.busy.check ? 'disabled' : ''}>${S.busy.check ? 'Checking…' : 'Check this app now'}</button></div>
+    ${versionsPanel(a)}
     <h3>Recent activity</h3>${ev.length ? ev.map(eventRow).join('') : '<p class="muted small">No deploys or errors recorded yet.</p>'}</div>`;
+}
+const VSTATUS = { good: ['Verified working', 'h-up'], verifying: ['Checking the new version…', 'h-asleep'], rolled_back: ['Rolled back to a working version', 'h-asleep'], failed: ['New version looks broken', 'h-down'] };
+function versionsPanel(a) {
+  const rows = [['vercel', 'Website', a.vercel_project], ['render', 'API', a.render_service]].filter(([, , has]) => has);
+  if (!rows.length) return '';
+  const c = S.brainStatus?.configured || {};
+  return `<h3>Versions</h3>${rows.map(([pf, label]) => {
+    const d = S.deployState.find((x) => x.app_id === a.id && x.platform === pf);
+    const [txt, cls] = d ? VSTATUS[d.status] || [d.status, ''] : ['Not tracked yet', 'h-unknown'];
+    const connected = pf === 'vercel' ? c.vercel : c.render;
+    return `<div class="item"><div class="row" style="justify-content:space-between"><strong>${label}</strong><span class="pill ${cls}">${esc(txt)}</span></div>
+      ${d ? `<p class="small muted">Live since ${ago(d.current_at)}${d.current_msg ? ` · “${esc(d.current_msg)}”` : ''}</p>` : ''}
+      ${d?.note ? `<p class="small">${esc(d.note)}</p>` : ''}
+      ${pf === 'vercel' && d?.paused_latest_id ? `<p class="small h-asleep">A newer website version is waiting. Auto-publishing is paused since the rollback.</p>` : ''}
+      <div class="row">${pf === 'vercel' && d?.paused_latest_id ? `<button class="btn sm primary" data-act="promote" data-id="${a.id}" ${S.busy.promote ? 'disabled' : ''}>${S.busy.promote ? 'Publishing…' : 'Publish latest version'}</button>` : ''}
+        <button class="btn sm danger" data-act="rollback" data-id="${a.id}" data-pf="${pf}" ${!connected || S.busy['rb' + pf] ? 'disabled' : ''}>${S.busy['rb' + pf] ? 'Rolling back…' : `Roll back ${label.toLowerCase()}`}</button></div></div>`;
+  }).join('')}`;
 }
 function tabMoney(a) {
   const m = appMoney(a);
@@ -640,6 +663,8 @@ function newKeyModal(k) {
 // Runs when you open Planet: gentle checks (throttled by the brain) + today's briefing.
 async function autoRun() {
   const a = S.prefs.automation;
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  if (tz && S.prefs.tz !== tz) savePrefs({ tz });
   try { S.brainStatus = await brain('status'); } catch (e) { S.brainStatus = { error: e.message }; }
   render();
   if (!S.apps.length) return;
@@ -823,6 +848,18 @@ const actions = {
     try { const r = await brain('briefing', { force: true }); S.briefing = r.briefing; } catch (e) { fail(e); } finally { S.busy.brief = false; render(); }
   },
   'ask-suggest': (d) => doAsk(d.q),
+  rollback: async (d) => {
+    const a = byId(d.id), what = d.pf === 'render' ? 'API' : 'website';
+    const extra = d.pf === 'vercel' ? '\n\nVercel will pause auto-publishing afterwards; use "Publish latest version" once a fix is ready.' : '\n\nAuto-deploys stay on: your next fix deploys normally.';
+    if (!confirm(`Roll back the ${what} of ${a.name} to its previous version?${extra}`)) return;
+    S.busy['rb' + d.pf] = true; render();
+    try { await brain('rollback', { app_id: d.id, platform: d.pf }); await loadOps(); toast(`${what} rolled back`); } catch (e) { fail(e); } finally { delete S.busy['rb' + d.pf]; render(); }
+  },
+  promote: async (d) => {
+    if (!confirm('Publish the newest website version and resume auto-publishing?')) return;
+    S.busy.promote = true; render();
+    try { await brain('promote_latest', { app_id: d.id }); await loadOps(); toast('Latest version published'); } catch (e) { fail(e); } finally { S.busy.promote = false; render(); }
+  },
   diagnose: async (d) => {
     S.busy['dg' + d.id] = true; render();
     try { await brain('diagnose', { event_id: d.id }); await loadOps(); toast('Diagnosis ready'); } catch (e) { fail(e); } finally { delete S.busy['dg' + d.id]; render(); }
@@ -934,7 +971,8 @@ const forms = {
     closeModal(); toast('Expense added');
   },
   automation: async (fd) => {
-    await savePrefs({ automation: { refreshOnOpen: !!fd.get('refreshOnOpen'), briefingOnOpen: !!fd.get('briefingOnOpen'), aiDiagnosis: !!fd.get('aiDiagnosis'), checkEveryHours: Math.max(1, Number(fd.get('checkEveryHours')) || 6) } });
+    await savePrefs({ automation: { ...S.prefs.automation, refreshOnOpen: !!fd.get('refreshOnOpen'), briefingOnOpen: !!fd.get('briefingOnOpen'), aiDiagnosis: !!fd.get('aiDiagnosis'), autoRollback: !!fd.get('autoRollback'),
+      briefingHour: Math.min(23, Math.max(0, Number(fd.get('briefingHour')) || 7)), checkEveryHours: Math.max(1, Number(fd.get('checkEveryHours')) || 6) } });
     render(); toast('Automation saved');
   },
   prices: async (fd) => {

@@ -78,17 +78,24 @@ async function unseal(ct: string, iv: string) {
 }
 
 // ---------- Claude ----------
-async function claude(system: string, messages: { role: string; content: string }[], max_tokens = 1200) {
+async function claude(system: string, messages: { role: string; content: string }[], max_tokens = 4000) {
   if (!ANTHROPIC_KEY) throw bad('The Anthropic key is not set up yet. Add ANTHROPIC_API_KEY in Supabase → Edge Functions → Secrets.', 412);
-  const r = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-    body: JSON.stringify({ model: MODEL, max_tokens, system, messages }),
-    signal: AbortSignal.timeout(90000),
-  });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw bad(`Claude API error ${r.status}: ${clip(j?.error?.message || JSON.stringify(j), 200)}`, 502);
-  return (j.content || []).filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n').trim();
+  // Up to two attempts: if the reply is cut off before any text (e.g. the budget went on reasoning), retry with a bigger budget.
+  for (let attempt = 0, budget = max_tokens; attempt < 2; attempt++, budget = Math.min(budget * 3, 16000)) {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: MODEL, max_tokens: budget, system, messages }),
+      signal: AbortSignal.timeout(120000),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw bad(`Claude API error ${r.status}: ${clip(j?.error?.message || JSON.stringify(j), 200)}`, 502);
+    const text = (j.content || []).filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n').trim();
+    if (text) return text;
+    console.warn('Claude returned no text', { stop_reason: j.stop_reason, types: (j.content || []).map((c: any) => c.type), attempt });
+    if (j.stop_reason !== 'max_tokens') throw bad(`Claude returned no text (stop reason: ${j.stop_reason || 'unknown'}). Try again in a moment.`, 502);
+  }
+  throw bad('Claude ran out of room before answering, even after a retry. Try a shorter question.', 502);
 }
 
 // ---------- monitoring ----------
@@ -164,17 +171,78 @@ async function syncDeploys(uid: string) {
   return out;
 }
 
+// Errors from the backends (and their websites) are grouped: same app + same kind + same message = one item,
+// counted per day, with a burst flag when many happen within 20 minutes.
+const ERROR_LABEL: Record<string, string> = {
+  JS_ERROR: 'Website error', JS_UNHANDLED_REJECTION: 'Website error', API_CALL_FAILED: 'Website: an API call failed',
+  NETWORK_ERROR: 'Website: network error', SLOW_RESPONSE: 'Slow response', AUTH_FAILED: 'Rejected keys or logins',
+};
+const normMsg = (m: string) => String(m || '').replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi, '<id>').replace(/\d+/g, '#').slice(0, 300);
 async function syncErrors(uid: string) {
   const list = await apps(uid);
   const bySlug = new Map(list.filter(slugOf).map((a) => [slugOf(a), a]));
-  if (!bySlug.size) return { errors: 0 };
-  const since = new Date(Date.now() - 7 * 864e5).toISOString();
-  const rows = must(await db.from('app_errors').select('id, app, error_code, message, severity, created_at')
-    .in('app', [...bySlug.keys()]).gte('created_at', since).order('created_at', { ascending: false }).limit(300)) as any[];
-  await addEvents(rows.map((e) => ({ owner: uid, app_id: bySlug.get(e.app)?.id, source: 'backend', kind: 'error', external_id: `err:${e.id}`,
-    severity: e.severity === 'critical' ? 'critical' : 'warn', title: `API error: ${clip(e.error_code || 'UNKNOWN', 60)}`,
-    detail: clip(e.message, 300), created_at: e.created_at })));
-  return { errors: rows.length };
+  if (!bySlug.size) return { errors: 0, groups: 0 };
+  const day = new Date().toISOString().slice(0, 10);
+  const rows = must(await db.from('app_errors').select('id, app, error_code, message, severity, created_at, context')
+    .in('app', [...bySlug.keys()]).gte('created_at', `${day}T00:00:00Z`).order('created_at', { ascending: false }).limit(3000)) as any[];
+  const groups = new Map<string, any>();
+  const burstSince = Date.now() - 20 * 60e3;
+  for (const e of rows) {
+    const norm = normMsg(e.message);
+    const k = `${e.app}|${e.error_code}|${norm}`;
+    const g = groups.get(k) || { app: e.app, code: e.error_code || 'UNKNOWN', message: e.message, norm, count: 0, recent: 0, first: e.created_at, last: e.created_at, browser: e.context?.source === 'browser' };
+    g.count++;
+    if (Date.parse(e.created_at) >= burstSince) g.recent++;
+    if (e.created_at < g.first) g.first = e.created_at;
+    if (e.created_at > g.last) g.last = e.created_at;
+    groups.set(k, g);
+  }
+  const out: any[] = [];
+  for (const g of groups.values()) {
+    const kind = g.code === 'SLOW_RESPONSE' ? 'slow' : g.code === 'AUTH_FAILED' ? 'auth' : 'error';
+    const severity = kind === 'auth' ? 'info' : kind === 'slow' ? 'warn' : (g.recent >= 5 || (!g.browser && g.count >= 10)) ? 'critical' : 'warn';
+    const label = ERROR_LABEL[g.code] || `Server error (${clip(g.code, 40)})`;
+    out.push({ owner: uid, app_id: bySlug.get(g.app)?.id, source: g.browser ? 'browser' : 'backend', kind, severity,
+      title: `${label} · ${g.count}× today${g.recent >= 2 ? ` · ${g.recent}× in the last 20 min` : ''}`,
+      detail: clip(g.message, 300), count: g.count, created_at: g.first, last_seen: g.last,
+      external_id: `grp:${(await sha256hex(`${g.app}|${g.code}|${g.norm}`)).slice(0, 24)}:${day}` });
+  }
+  if (out.length) {
+    const { error } = await db.from('planet_events').upsert(out, { onConflict: 'owner,source,external_id' });
+    if (error) throw error;
+  }
+  return { errors: rows.length, groups: out.length };
+}
+
+// AI diagnosis of an error group: reads recent examples plus the relevant source file, explains the likely cause.
+async function diagnose(uid: string, eventId: number) {
+  const ev = must(await db.from('planet_events').select('*').eq('owner', uid).eq('id', eventId).maybeSingle()) as any;
+  if (!ev) throw bad('Item not found', 404);
+  if (!['error', 'slow'].includes(ev.kind)) throw bad('Only errors and slow responses can be diagnosed');
+  const a = ev.app_id ? await ownApp(uid, ev.app_id) : null;
+  if (!a) throw bad('This item is not linked to an app');
+  const since = new Date(Date.now() - 3 * 864e5).toISOString();
+  const samples = (must(await db.from('app_errors').select('error_code, message, stack_trace, context, created_at').eq('app', slugOf(a))
+    .gte('created_at', since).order('created_at', { ascending: false }).limit(200)) as any[])
+    .filter((e) => normMsg(e.message) === normMsg(ev.detail || '')).slice(0, 5);
+  const file = ev.source === 'browser' ? 'frontend/src/App.tsx' : 'backend/src/server.ts';
+  const code = a.github_repo ? await fetchRepoFile(a.github_repo, file) : null;
+  const text = await claude(`${PERSONA}\nYou diagnose production problems for a non-technical owner.`, [{ role: 'user', content:
+    `App: ${a.name}. Problem: ${ev.title}\nMessage: ${ev.detail}\nFirst seen ${ev.created_at}, last seen ${ev.last_seen || ev.created_at}, ${ev.count} times today.\n\nRecent examples (JSON):\n${JSON.stringify(samples).slice(0, 6000)}\n\n${code ? `Source file ${file}:\n${code}` : 'Source code not available.'}\n\n` +
+    `Write a diagnosis in plain English. Plain text, these headings each followed by a colon: What is happening, Likely cause, How serious, What to do next.\nIf the evidence is thin, say so and say what would confirm it. Under 220 words. No code blocks.` }], 4000);
+  must(await db.from('planet_events').update({ diagnosis: text, diagnosed_at: new Date().toISOString() }).eq('id', ev.id).eq('owner', uid));
+  return { diagnosis: text };
+}
+async function autoDiagnose(uid: string, max = 2) {
+  if (!ANTHROPIC_KEY) return 'skipped (no Anthropic key)';
+  const since = new Date(Date.now() - 24 * 3600e3).toISOString();
+  const evs = must(await db.from('planet_events').select('id, app_id, severity, count').eq('owner', uid).in('kind', ['error', 'slow'])
+    .is('diagnosis', null).gte('last_seen', since).order('severity', { ascending: true }).limit(20)) as any[];
+  const levels = new Map((await apps(uid)).map((a) => [a.id, a.ai_level ?? 1]));
+  const todo = evs.filter((e) => (levels.get(e.app_id) ?? 0) >= 1 && (e.severity === 'critical' || e.count >= 3)).slice(0, max);
+  let done = 0;
+  for (const e of todo) { try { await diagnose(uid, e.id); done++; } catch (err) { console.warn('auto-diagnose failed', err); } }
+  return `${done} diagnosed`;
 }
 
 // ---------- customer API keys (xag_api_keys; app = slug) ----------
@@ -361,12 +429,12 @@ async function ask(uid: string, question: string) {
   const snap = await snapshot(uid);
   const hist = (must(await db.from('planet_chat').select('role, content').eq('owner', uid).order('created_at', { ascending: false }).limit(10)) as any[]).reverse();
   const answer = await claude(`${PERSONA}\n\nCurrent portfolio data (JSON):\n${JSON.stringify(snap)}`,
-    [...hist.map((h) => ({ role: h.role, content: h.content })), { role: 'user', content: question }], 1200);
+    [...hist.map((h) => ({ role: h.role, content: h.content })), { role: 'user', content: question }], 4000);
   must(await db.from('planet_chat').insert([{ owner: uid, role: 'user', content: question }, { owner: uid, role: 'assistant', content: answer }]));
   return { answer };
 }
 async function briefing(uid: string, force = false) {
-  const last = must(await db.from('planet_briefings').select('*').eq('owner', uid).order('created_at', { ascending: false }).limit(1).maybeSingle()) as any;
+  const last = must(await db.from('planet_briefings').select('*').eq('owner', uid).neq('content', '').order('created_at', { ascending: false }).limit(1).maybeSingle()) as any;
   if (!force && last && Date.now() - new Date(last.created_at).getTime() < 20 * 3600e3) return { briefing: last, fresh: false };
   const snap = await snapshot(uid);
   const content = await claude(`${PERSONA}\n\nPortfolio data (JSON):\n${JSON.stringify(snap)}`, [{ role: 'user', content:
@@ -374,7 +442,8 @@ async function briefing(uid: string, force = false) {
 Line 1: a one-sentence overall status.
 Then up to 5 numbered items, most important first, each one line: what needs attention and the next step in Planet. If nothing needs attention, say so in one line.
 Last line: one sentence on money (revenue/expenses), or say payments aren't connected yet.
-Plain text only, no markdown symbols, under 170 words.` }], 700);
+Plain text only, no markdown symbols, under 170 words.` }], 3000);
+  if (!content.trim()) throw bad('The briefing came back empty. Try Refresh in a moment.', 502);
   const row = must(await db.from('planet_briefings').insert({ owner: uid, content }).select().single());
   return { briefing: row, fresh: true };
 }
@@ -391,11 +460,212 @@ async function explain(uid: string, appId: string) {
   if (!got.length) throw bad('Could not read the repo. If it is private, add a GITHUB_TOKEN secret.');
   const text = await claude(`${PERSONA}\nYou explain software to its non-technical owner using the source files provided.`, [{ role: 'user', content:
     `Explain the app "${a.name}" in plain English for its owner.\nSections (plain text headings followed by a colon): What it does, The main parts, Where its data lives, What it connects to, What is still a placeholder or missing, Risks to know about.\nShort sentences. No code. Under 400 words.\n\n` +
-    got.map(([p, t]) => `=== ${p} ===\n${t}`).join('\n\n') }], 1500);
+    got.map(([p, t]) => `=== ${p} ===\n${t}`).join('\n\n') }], 5000);
   const title = 'Plain-English explanation (AI)';
   await db.from('planet_items').delete().eq('owner', uid).eq('app_id', a.id).eq('title', title);
   must(await db.from('planet_items').insert({ owner: uid, app_id: a.id, kind: 'doc', title, body: text }));
   return { explanation: text };
+}
+
+
+// ---------- deploy watch, rollback, scheduler ----------
+// Vercel: current live = project.targets.production. After a rollback Vercel pauses auto-publishing until a deploy is promoted.
+// Render: current live = the deploy with status "live". Rolling back via the API keeps auto-deploys on.
+const VQ = `slug=${VERCEL_SLUG}`;
+async function vGet(path: string) {
+  const { r } = await timed(`https://api.vercel.com${path}${path.includes('?') ? '&' : '?'}${VQ}`, { headers: { Authorization: `Bearer ${VERCEL_TOKEN}` } }, 15000);
+  if (!r || !r.ok) throw new Error(`Vercel ${path.split('?')[0]} failed${r ? ' (' + r.status + ')' : ''}`);
+  return await r.json();
+}
+async function vPost(path: string) {
+  const { r } = await timed(`https://api.vercel.com${path}?${VQ}`, { method: 'POST', headers: { Authorization: `Bearer ${VERCEL_TOKEN}`, 'Content-Type': 'application/json' } }, 30000);
+  if (!r || !r.ok) { const t = r ? await r.text() : 'no response'; throw new Error(`Vercel refused: ${clip(t, 200)}`); }
+}
+const RH = () => ({ Authorization: `Bearer ${RENDER_KEY}`, Accept: 'application/json', 'Content-Type': 'application/json' });
+async function renderServiceId(name: string) {
+  const { r } = await timed(`https://api.render.com/v1/services?name=${encodeURIComponent(name)}&limit=5`, { headers: RH() }, 15000);
+  const svc = r && r.ok ? ((await r.json()) as any[]).map((x) => x.service).find((s) => s?.name === name) : null;
+  return svc?.id as string | undefined;
+}
+async function platformStatus(a: any) {
+  const out: any = {};
+  if (VERCEL_TOKEN && a.vercel_project) {
+    try {
+      const p = await vGet(`/v9/projects/${encodeURIComponent(a.vercel_project)}`);
+      const list = ((await vGet(`/v6/deployments?projectId=${p.id}&target=production&limit=10`)).deployments || []).filter((d: any) => (d.state || d.readyState) === 'READY');
+      const liveId = p.targets?.production?.id || list[0]?.uid;
+      const i = list.findIndex((d: any) => d.uid === liveId);
+      const live = i >= 0 ? list[i] : null;
+      const latest = list[0];
+      out.vercel = { projectId: p.id, liveId, liveAt: live ? new Date(live.created).toISOString() : null, liveMsg: live?.meta?.githubCommitMessage || '',
+        previousId: i >= 0 ? list[i + 1]?.uid || null : null,
+        pausedLatestId: latest && liveId && latest.uid !== liveId && (!live || latest.created > live.created) ? latest.uid : null,
+        pausedLatestMsg: latest?.meta?.githubCommitMessage || '' };
+    } catch (e) { out.vercel = { error: (e as Error).message }; }
+  }
+  if (RENDER_KEY && a.render_service) {
+    try {
+      const id = await renderServiceId(a.render_service);
+      if (id) {
+        const { r } = await timed(`https://api.render.com/v1/services/${id}/deploys?limit=15`, { headers: RH() }, 15000);
+        const ds = r && r.ok ? ((await r.json()) as any[]).map((x) => x.deploy) : [];
+        const i = ds.findIndex((d) => d.status === 'live');
+        const live = i >= 0 ? ds[i] : null;
+        const prev = i >= 0 ? ds.slice(i + 1).find((d) => d.status === 'deactivated') : null;
+        out.render = { serviceId: id, liveId: live?.id || null, liveAt: live?.finishedAt || live?.createdAt || null, liveMsg: live?.commit?.message || '',
+          previousId: prev?.id || null, building: ds.slice(0, Math.max(i, 0)).some((d) => /in_progress|created/.test(d.status)) };
+      }
+    } catch (e) { out.render = { error: (e as Error).message }; }
+  }
+  return out;
+}
+async function verifyTarget(a: any, platform: string, since: string) {
+  if (platform === 'render') {
+    const { r, timeout } = await timed(a.backend_url.replace(/\/$/, '') + '/health', {}, 20000);
+    if (r && r.ok) { const j = await r.json().catch(() => null); return j?.status === 'healthy' || !j?.status ? 'ok' : 'fail'; }
+    if (timeout || (r && (r.status === 502 || r.status === 503))) return 'unknown';
+    return 'fail';
+  }
+  const { r } = await timed(a.frontend_url, {}, 12000);
+  if (!r || !r.ok) return 'fail';
+  const { count } = await db.from('app_errors').select('id', { count: 'exact', head: true }).eq('app', slugOf(a)).eq('context->>source', 'browser').gte('created_at', since);
+  return (count || 0) >= 5 ? 'fail' : 'ok';
+}
+async function doRollback(a: any, platform: string, cur: any, targetId: string) {
+  if (platform === 'render') {
+    const { r } = await timed(`https://api.render.com/v1/services/${cur.serviceId}/rollback`, { method: 'POST', headers: RH(), body: JSON.stringify({ deployId: targetId }) }, 30000);
+    if (!r || !r.ok) throw new Error(`Render refused the rollback${r ? ': ' + clip(await r.text(), 200) : ''}`);
+  } else {
+    await vPost(`/v1/projects/${cur.projectId}/rollback/${targetId}`);
+  }
+}
+async function setState(uid: string, a: any, platform: string, patch: any) {
+  must(await db.from('planet_deploy_state').upsert({ app_id: a.id, platform, owner: uid, updated_at: new Date().toISOString(), ...patch }, { onConflict: 'app_id,platform' }));
+}
+async function deployWatch(uid: string, autoRollback: boolean) {
+  const list = await apps(uid);
+  const states = must(await db.from('planet_deploy_state').select('*').eq('owner', uid)) as any[];
+  const summary: string[] = [];
+  for (const a of list) {
+    const ps = await platformStatus(a);
+    for (const platform of ['vercel', 'render'] as const) {
+      const cur = ps[platform];
+      if (!cur || cur.error || !cur.liveId) continue;
+      const st = states.find((s) => s.app_id === a.id && s.platform === platform);
+      const label = platform === 'render' ? 'API' : 'website';
+      if (platform === 'vercel' && (st?.paused_latest_id || null) !== (cur.pausedLatestId || null)) {
+        await setState(uid, a, platform, { paused_latest_id: cur.pausedLatestId || null });
+      }
+      if (!st || st.current_id !== cur.liveId) {
+        await setState(uid, a, platform, { current_id: cur.liveId, current_at: cur.liveAt || new Date().toISOString(), current_msg: clip(cur.liveMsg, 200),
+          status: st ? 'verifying' : 'good', previous_good_id: st?.status === 'good' ? st.current_id : (st?.previous_good_id || cur.previousId), fail_count: 0,
+          verified_at: st ? null : new Date().toISOString(), note: st ? null : 'First seen by Planet; assumed good' });
+        if (st) summary.push(`${a.name} ${label}: new version, verifying`);
+        continue;
+      }
+      if (st.status !== 'verifying') continue;
+      const ageMin = (Date.now() - Date.parse(st.current_at || st.updated_at)) / 60000;
+      const verdict = await verifyTarget(a, platform, st.current_at || st.updated_at);
+      if (verdict === 'ok') {
+        if (platform === 'render' || ageMin >= 10) { await setState(uid, a, platform, { status: 'good', verified_at: new Date().toISOString(), fail_count: 0, note: null }); summary.push(`${a.name} ${label}: verified healthy`); }
+      } else if (verdict === 'unknown') {
+        if (ageMin > 90) await setState(uid, a, platform, { status: 'good', verified_at: new Date().toISOString(), note: 'Not verified: the service stayed asleep' });
+      } else {
+        const fails = (st.fail_count || 0) + 1;
+        if (fails < 2) { await setState(uid, a, platform, { fail_count: fails, note: 'First failed check; confirming on the next run' }); continue; }
+        const target = st.previous_good_id || cur.previousId;
+        if (autoRollback && target) {
+          try {
+            await doRollback(a, platform, cur, target);
+            await setState(uid, a, platform, { status: 'rolled_back', fail_count: fails, rolled_back_at: new Date().toISOString(), rolled_back_from: cur.liveId,
+              note: platform === 'vercel' ? 'Rolled back automatically. Vercel has paused auto-publishing until you publish a fixed version.' : 'Rolled back automatically. Auto-deploys stay on: your next fix deploys normally.' });
+            await addEvents([{ owner: uid, app_id: a.id, source: 'ai', kind: 'rollback', severity: 'critical', external_id: `rb:${platform}:${cur.liveId}`,
+              title: `Auto-rolled back the ${label}`, detail: `The new version failed its health checks twice, so Planet switched back to the last working version. ${clip(cur.liveMsg, 120)}` }]);
+            summary.push(`${a.name} ${label}: ROLLED BACK`);
+          } catch (e) {
+            await setState(uid, a, platform, { status: 'failed', fail_count: fails, note: `Rollback failed: ${clip((e as Error).message, 200)}` });
+            await addEvents([{ owner: uid, app_id: a.id, source: 'ai', kind: 'rollback', severity: 'critical', external_id: `rbfail:${platform}:${cur.liveId}`,
+              title: `New ${label} version is broken and the automatic rollback failed`, detail: clip((e as Error).message, 250) }]);
+          }
+        } else {
+          await setState(uid, a, platform, { status: 'failed', fail_count: fails, note: autoRollback ? 'No earlier working version to go back to' : 'Auto-rollback is off: use Roll back in Planet' });
+          await addEvents([{ owner: uid, app_id: a.id, source: 'ai', kind: 'rollback', severity: 'critical', external_id: `bad:${platform}:${cur.liveId}`,
+            title: `New ${label} version looks broken`, detail: autoRollback ? 'No earlier working version was available to roll back to.' : 'Auto-rollback is off. Open the app in Planet and press Roll back.' }]);
+        }
+      }
+    }
+  }
+  return summary;
+}
+async function manualRollback(uid: string, appId: string, platform: string) {
+  const a = await ownApp(uid, appId);
+  if (!['vercel', 'render'].includes(platform)) throw bad('Unknown platform');
+  if (platform === 'vercel' && !VERCEL_TOKEN) throw bad('Connect VERCEL_TOKEN first (Settings → Connections).');
+  if (platform === 'render' && !RENDER_KEY) throw bad('Connect RENDER_API_KEY first (Settings → Connections).');
+  const cur = (await platformStatus(a))[platform];
+  if (!cur || cur.error) throw bad(cur?.error || 'Could not read the current deploy');
+  const st = must(await db.from('planet_deploy_state').select('*').eq('app_id', a.id).eq('platform', platform).maybeSingle()) as any;
+  const target = platform === 'vercel' ? cur.previousId : (st?.previous_good_id && st.previous_good_id !== cur.liveId ? st.previous_good_id : cur.previousId);
+  if (!target) throw bad('There is no earlier version to go back to.');
+  await doRollback(a, platform, cur, target);
+  await setState(uid, a, platform, { status: 'rolled_back', rolled_back_at: new Date().toISOString(), rolled_back_from: cur.liveId,
+    note: platform === 'vercel' ? 'Rolled back by you. Auto-publishing is paused until you publish a version.' : 'Rolled back by you. Auto-deploys stay on.' });
+  await addEvents([{ owner: uid, app_id: a.id, source: 'ai', kind: 'rollback', severity: 'warn', external_id: `manual:${platform}:${cur.liveId}:${Date.now()}`,
+    title: `Rolled back the ${platform === 'render' ? 'API' : 'website'} (by you)`, detail: clip(cur.liveMsg, 200) }]);
+  return { rolled_back: true, platform };
+}
+async function promoteLatest(uid: string, appId: string) {
+  const a = await ownApp(uid, appId);
+  if (!VERCEL_TOKEN) throw bad('Connect VERCEL_TOKEN first.');
+  const cur = (await platformStatus(a)).vercel;
+  if (!cur || cur.error) throw bad(cur?.error || 'Could not read Vercel');
+  const target = cur.pausedLatestId;
+  if (!target) throw bad('The newest version is already live.');
+  await vPost(`/v10/projects/${cur.projectId}/promote/${target}`);
+  await setState(uid, a, 'vercel', { paused_latest_id: null, note: 'Latest version published; auto-publishing resumed' });
+  await addEvents([{ owner: uid, app_id: a.id, source: 'ai', kind: 'deploy', severity: 'info', external_id: `promote:${target}`,
+    title: 'Published the latest website version (auto-publishing resumed)', detail: clip(cur.pausedLatestMsg, 200) }]);
+  return { promoted: target };
+}
+
+// Scheduled run (pg_cron, every 10 minutes). Authenticated by a random code stored in a server-only table.
+async function cronToken() {
+  const row = must(await db.from('planet_private_settings').select('value').eq('key', 'cron_token').maybeSingle()) as any;
+  return row?.value as string | undefined;
+}
+function sameSecret(a: string, b: string) {
+  if (!a || !b || a.length !== b.length) return false;
+  let d = 0; for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i); return d === 0;
+}
+function localHour(tz: string) {
+  try { return Number(new Intl.DateTimeFormat('en-GB', { hour: '2-digit', hour12: false, timeZone: tz }).format(new Date())); } catch { return new Date().getUTCHours(); }
+}
+async function cronTick() {
+  const owners = must(await db.from('planet_settings').select('owner, prefs')) as any[];
+  const report: any[] = [];
+  for (const o of owners) {
+    const uid = o.owner, prefs = o.prefs || {}, auto = { refreshOnOpen: true, checkEveryHours: 6, briefingOnOpen: true, aiDiagnosis: true, autoRollback: true, briefingHour: 7, maxDiagnosesPerDay: 10, ...(prefs.automation || {}) };
+    if (!(await apps(uid)).length) continue;
+    const r: any = { owner: uid.slice(0, 8) };
+    r.deploys = await syncDeploys(uid).then(() => 'ok').catch((e) => String(e.message || e));
+    r.watch = await deployWatch(uid, auto.autoRollback !== false).catch((e) => String(e.message || e));
+    const last = must(await db.from('planet_checks').select('checked_at').eq('owner', uid).order('checked_at', { ascending: false }).limit(1).maybeSingle()) as any;
+    if (!last || Date.now() - Date.parse(last.checked_at) > Math.max(1, Number(auto.checkEveryHours) || 6) * 3600e3) r.checks = (await runChecks(uid).catch(() => [])).length;
+    r.errors = await syncErrors(uid).catch((e) => String(e.message || e));
+    if (auto.aiDiagnosis !== false && ANTHROPIC_KEY) {
+      const dayStart = new Date(); dayStart.setUTCHours(0, 0, 0, 0);
+      const { count } = await db.from('planet_events').select('id', { count: 'exact', head: true }).eq('owner', uid).gte('diagnosed_at', dayStart.toISOString());
+      const left = Math.max(0, (Number(auto.maxDiagnosesPerDay) || 10) - (count || 0));
+      r.diagnosis = left ? await autoDiagnose(uid, Math.min(2, left)).catch((e) => String(e.message || e)) : 'daily limit reached';
+    }
+    const stale = must(await db.from('planet_payment_links').select('id').eq('owner', uid).or(`last_sync_at.is.null,last_sync_at.lt.${new Date(Date.now() - 3600e3).toISOString()}`)) as any[];
+    if (stale.length) r.payments = await paySync(uid).catch((e) => String(e.message || e));
+    if (auto.briefingOnOpen !== false && ANTHROPIC_KEY && localHour(prefs.tz || 'Asia/Bangkok') >= (Number(auto.briefingHour) || 7)) {
+      r.briefing = await briefing(uid, false).then((x) => (x.fresh ? 'written' : 'already done')).catch((e) => String(e.message || e));
+    }
+    report.push(r);
+  }
+  return { ran_at: new Date().toISOString(), owners: report };
 }
 
 // ---------- router ----------
@@ -405,6 +675,13 @@ Deno.serve(async (req) => {
   const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { ...h, 'Content-Type': 'application/json' } });
   try {
     if (req.method !== 'POST') throw bad('POST only', 405);
+    // Scheduled run from the database (pg_cron). Checked before user sign-in.
+    const cronHeader = req.headers.get('x-planet-cron');
+    if (cronHeader) {
+      const tok = await cronToken();
+      if (!tok || !sameSecret(cronHeader, tok)) throw bad('Forbidden', 403);
+      return json(await cronTick());
+    }
     const token = (req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '');
     const { data: u, error: ue } = await db.auth.getUser(token);
     if (ue || !u?.user) throw bad('Please sign in again', 401);
@@ -423,6 +700,7 @@ Deno.serve(async (req) => {
         else r.checks = 'skipped (checked recently)';
         r.deploys = await syncDeploys(uid).then((x) => ({ vercel: x.vercel, render: x.render })).catch((e) => String(e.message || e));
         r.errors = await syncErrors(uid).catch((e) => String(e.message || e));
+        if (b.auto_diagnose) r.diagnosis = await autoDiagnose(uid).catch((e) => String(e.message || e));
         r.payments = await paySync(uid).catch((e) => String(e.message || e));
         return json(r);
       }
@@ -436,6 +714,11 @@ Deno.serve(async (req) => {
       case 'chat_clear': must(await db.from('planet_chat').delete().eq('owner', uid)); return json({ cleared: true });
       case 'briefing': return json(await briefing(uid, !!b.force));
       case 'explain': return json(await explain(uid, b.app_id));
+      case 'diagnose': return json(await diagnose(uid, Number(b.event_id)));
+      case 'deploy_status': { const a = await ownApp(uid, b.app_id); return json(await platformStatus(a)); }
+      case 'rollback': return json(await manualRollback(uid, b.app_id, String(b.platform)));
+      case 'promote_latest': return json(await promoteLatest(uid, b.app_id));
+      case 'deploy_watch': return json({ summary: await deployWatch(uid, b.auto_rollback !== false) });
       default: throw bad('Unknown action');
     }
   } catch (e) {
