@@ -35,7 +35,7 @@ const DEFAULT_PREFS = {
     { key: 'price', label: 'Price / plan', type: 'text' },
     { key: 'launch_date', label: 'Launch date', type: 'date' },
   ],
-  automation: { refreshOnOpen: true, checkEveryHours: 6, briefingOnOpen: true },
+  automation: { refreshOnOpen: true, checkEveryHours: 6, briefingOnOpen: true, aiDiagnosis: true },
   prices: { vercelPro: 20, supabasePro: 25, renderStarter: 7 },
   currency: 'usd',
 };
@@ -94,11 +94,14 @@ const isLive = (a) => (S.prefs.liveStatuses || []).includes(a.status);
 function latestCheck(appId, target) { return S.checks.find((c) => c.app_id === appId && c.target === target); }
 function health(a) {
   const w = latestCheck(a.id, 'website'), p = latestCheck(a.id, 'api');
+  const hourAgo = Date.now() - 3600e3;
+  if (S.events.some((e) => e.app_id === a.id && e.severity === 'critical' && e.kind === 'error' && new Date(e.last_seen || e.created_at).getTime() >= hourAgo)) return 'down';
   if (!w && !p) return 'unknown';
   if ((w && w.state === 'down') || (p && p.state === 'down')) return 'down';
   if (p && p.state === 'asleep') return 'asleep';
   return 'up';
 }
+function errorsToday(appId) { const d = new Date().toISOString().slice(0, 10); return S.events.filter((e) => e.app_id === appId && e.kind === 'error' && String(e.external_id || '').endsWith(d)).reduce((t, e) => t + (e.count || 1), 0); }
 const HEALTH_LABEL = { up: 'Healthy', asleep: 'Asleep (normal on free plan)', down: 'Needs attention', unknown: 'Not checked yet' };
 const ago = (t) => { if (!t) return 'never'; const m = Math.round((Date.now() - new Date(t).getTime()) / 60000); return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`; };
 const money = (cents, cur = 'usd') => { try { return new Intl.NumberFormat(undefined, { style: 'currency', currency: String(cur).toUpperCase() }).format((cents || 0) / 100); } catch { return `${((cents || 0) / 100).toFixed(2)} ${String(cur).toUpperCase()}`; } };
@@ -287,7 +290,7 @@ function appsView() {
       <button class="app-row" data-act="open" data-id="${a.id}" style="--c:${esc(a.color)}">
         <span class="disc" aria-hidden="true">${esc(a.icon || '🪐')}</span>
         <span class="meta"><strong>${a.pinned ? '📌 ' : ''}${esc(a.name)}</strong><span>${esc(a.category || 'Uncategorised')}${a.tagline ? ' — ' + esc(a.tagline) : ''}</span></span>
-        <span class="pill ${isLive(a) ? 'live' : ''}">${esc(a.status)}</span>
+        <span class="row" style="gap:.4rem">${(() => { const n = errorsToday(a.id); return n ? `<span class="pill h-down">${n} error${n === 1 ? '' : 's'} today</span>` : ''; })()}<span class="pill ${isLive(a) ? 'live' : ''}">${esc(a.status)}</span></span>
       </button>`).join('')}</div>`;
 }
 
@@ -354,6 +357,7 @@ function settingsView() {
       <label class="row"><input type="checkbox" name="refreshOnOpen" ${S.prefs.automation.refreshOnOpen ? 'checked' : ''} style="width:auto" /> Check health, deploys, errors and payments when I open Planet</label>
       <label class="field"><span>Check each app at most every … hours (wakes sleeping free services, so keep this gentle)</span><input name="checkEveryHours" type="number" min="1" max="72" value="${esc(S.prefs.automation.checkEveryHours)}" style="max-width:8rem" /></label>
       <label class="row"><input type="checkbox" name="briefingOnOpen" ${S.prefs.automation.briefingOnOpen ? 'checked' : ''} style="width:auto" /> Write my daily briefing (at most once every 20 hours)</label>
+      <label class="row"><input type="checkbox" name="aiDiagnosis" ${S.prefs.automation.aiDiagnosis ? 'checked' : ''} style="width:auto" /> Diagnose serious or repeated errors with AI automatically (up to 2 per refresh; only apps at AI level Recommend or higher)</label>
       <p class="small muted">AI fixes and automatic deploys are switched off. They arrive in a later phase as proposals you approve, never automatic changes.</p>
       <div><button class="btn primary">Save automation</button></div>
     </form>
@@ -488,15 +492,20 @@ function scrollChat() { requestAnimationFrame(() => window.scrollTo({ top: docum
 
 function activityView() {
   const f = S.evFilter;
-  const list = S.events.filter((e) => !f || e.severity === f || e.kind === f);
-  return `<div class="page-head"><div><h1>Activity</h1><p class="muted">Deploys, errors and syncs across every app.</p></div><button class="btn" data-act="refresh" ${S.busy.refresh ? 'disabled' : ''}>${S.busy.refresh ? 'Checking…' : 'Refresh now'}</button></div>
-  <div class="row" style="margin-bottom:1rem">${[['', 'All'], ['critical', 'Critical'], ['warn', 'Warnings'], ['deploy', 'Deploys'], ['error', 'Errors']].map(([k, l]) => `<button class="btn sm ${f === k ? 'primary' : ''}" data-act="ev-filter" data-f="${k}">${l}</button>`).join('')}</div>
+  const list = S.events.filter((e) => !f || e.severity === f || e.kind === f || e.source === f);
+  return `<div class="page-head"><div><h1>Activity</h1><p class="muted">Errors, slow responses and deploys across every app. Repeats are grouped per day.</p></div><button class="btn" data-act="refresh" ${S.busy.refresh ? 'disabled' : ''}>${S.busy.refresh ? 'Checking…' : 'Refresh now'}</button></div>
+  <div class="row" style="margin-bottom:1rem">${[['', 'All'], ['critical', 'Serious'], ['error', 'Errors'], ['browser', 'Website'], ['slow', 'Slow'], ['deploy', 'Deploys']].map(([k, l]) => `<button class="btn sm ${f === k ? 'primary' : ''}" data-act="ev-filter" data-f="${k}">${l}</button>`).join('')}</div>
   ${list.length ? `<div class="app-list">${list.map(eventRow).join('')}</div>` : `<div class="empty"><p class="muted">Nothing here yet. Deploys appear once the Vercel and Render tokens are connected (Settings → Connections); errors appear as soon as an app reports one.</p></div>`}`;
 }
+const SOURCE_LABEL = { backend: 'API', browser: 'website', vercel: 'Vercel', render: 'Render', payments: 'payments', ai: 'AI' };
 function eventRow(e) {
   const a = byId(e.app_id);
-  return `<div class="item ev ${esc(e.severity)}"><div class="row" style="justify-content:space-between"><strong>${esc(e.title)}</strong><span class="small muted">${ago(e.created_at)}</span></div>
-    <p class="small">${a ? `<a href="#" data-act="open" data-id="${a.id}">${esc(a.name)}</a>` : 'Portfolio'} · ${esc(e.source)}</p>${e.detail ? `<p class="small muted">${esc(e.detail)}</p>` : ''}</div>`;
+  const canDiagnose = ['error', 'slow'].includes(e.kind) && a;
+  return `<div class="item ev ${esc(e.severity)}"><div class="row" style="justify-content:space-between"><strong>${esc(e.title)}</strong><span class="small muted">${e.last_seen ? `last ${ago(e.last_seen)}` : ago(e.created_at)}</span></div>
+    <p class="small">${a ? `<a href="#" data-act="open" data-id="${a.id}">${esc(a.name)}</a>` : 'Portfolio'} · ${esc(SOURCE_LABEL[e.source] || e.source)}${e.severity === 'critical' ? ' · <span class="h-down">serious</span>' : ''}</p>
+    ${e.detail ? `<p class="small muted">${esc(e.detail)}</p>` : ''}
+    ${e.diagnosis ? `<details class="diag" open><summary><strong>AI diagnosis</strong> <span class="small muted">${ago(e.diagnosed_at)}</span></summary><p style="white-space:pre-wrap">${esc(e.diagnosis)}</p></details>`
+      : canDiagnose ? `<div><button class="btn sm" data-act="diagnose" data-id="${e.id}" ${S.busy['dg' + e.id] || aiOff() ? 'disabled' : ''}>${S.busy['dg' + e.id] ? 'Diagnosing…' : '🩺 Diagnose with AI'}</button></div>` : ''}</div>`;
 }
 
 const LIVE_SUBS = ['active', 'trialing', 'past_due', 'on_trial'];
@@ -636,7 +645,7 @@ async function autoRun() {
   if (!S.apps.length) return;
   if (a.refreshOnOpen) {
     S.busy.refresh = true; render();
-    try { await brain('refresh_all', { check_every_hours: a.checkEveryHours }); await loadOps(); } catch (e) { console.warn(e); }
+    try { await brain('refresh_all', { check_every_hours: a.checkEveryHours, auto_diagnose: a.aiDiagnosis && S.brainStatus?.configured?.anthropic }); await loadOps(); } catch (e) { console.warn(e); }
     S.busy.refresh = false; render();
   }
   if (a.briefingOnOpen && S.brainStatus?.configured?.anthropic) {
@@ -798,7 +807,7 @@ const actions = {
   'open-tab': (d, e) => { e?.preventDefault(); S.openId = d.id; S.tab = d.tab || 'overview'; render(); },
   refresh: async () => {
     if (S.busy.refresh) return; S.busy.refresh = true; render();
-    try { const r = await brain('refresh_all', { force_checks: true, check_every_hours: S.prefs.automation.checkEveryHours }); await loadOps(); toast(`Checked ${typeof r.checks === 'number' ? r.checks + ' endpoints' : 'apps'}`); }
+    try { const r = await brain('refresh_all', { force_checks: true, check_every_hours: S.prefs.automation.checkEveryHours, auto_diagnose: S.prefs.automation.aiDiagnosis }); await loadOps(); toast(`Checked ${typeof r.checks === 'number' ? r.checks + ' endpoints' : 'apps'}`); }
     catch (e) { fail(e); } finally { S.busy.refresh = false; render(); }
   },
   'check-app': async (d) => {
@@ -814,6 +823,10 @@ const actions = {
     try { const r = await brain('briefing', { force: true }); S.briefing = r.briefing; } catch (e) { fail(e); } finally { S.busy.brief = false; render(); }
   },
   'ask-suggest': (d) => doAsk(d.q),
+  diagnose: async (d) => {
+    S.busy['dg' + d.id] = true; render();
+    try { await brain('diagnose', { event_id: d.id }); await loadOps(); toast('Diagnosis ready'); } catch (e) { fail(e); } finally { delete S.busy['dg' + d.id]; render(); }
+  },
   'chat-clear': async () => { if (!confirm('Clear the whole chat history?')) return; await brain('chat_clear'); S.chat = []; render(); },
   'ev-filter': (d) => { S.evFilter = d.f; render(); },
   'keys-reload': (d) => { delete S.keysByApp[d.id]; render(); },
@@ -921,7 +934,7 @@ const forms = {
     closeModal(); toast('Expense added');
   },
   automation: async (fd) => {
-    await savePrefs({ automation: { refreshOnOpen: !!fd.get('refreshOnOpen'), briefingOnOpen: !!fd.get('briefingOnOpen'), checkEveryHours: Math.max(1, Number(fd.get('checkEveryHours')) || 6) } });
+    await savePrefs({ automation: { refreshOnOpen: !!fd.get('refreshOnOpen'), briefingOnOpen: !!fd.get('briefingOnOpen'), aiDiagnosis: !!fd.get('aiDiagnosis'), checkEveryHours: Math.max(1, Number(fd.get('checkEveryHours')) || 6) } });
     render(); toast('Automation saved');
   },
   prices: async (fd) => {
